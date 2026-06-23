@@ -1,5 +1,6 @@
 mod app;
 mod dashboard;
+mod theme;
 mod ui;
 
 use std::io;

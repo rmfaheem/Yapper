@@ -8,6 +8,8 @@ use crate::db::FloodParams;
 use crate::metrics::Metrics;
 use crate::stats::ServerStats;
 
+pub use super::theme::ChartStyle;
+
 /// How many samples of history to keep for the sparklines.
 pub const HISTORY: usize = 120;
 
@@ -81,10 +83,13 @@ pub struct App {
 
     // Which server-stats tab is showing.
     pub active_tab: usize,
+    // How time-series widgets are drawn (toggled live with Ctrl+B).
+    pub chart_style: ChartStyle,
 
     // Server-side stats + history.
     pub stats: Option<ServerStats>,
     pub cpu_hist: VecDeque<u64>,
+    pub mem_hist: VecDeque<u64>,
     pub disk_read_hist: VecDeque<u64>,
     pub disk_write_hist: VecDeque<u64>,
     pub disk_read_ops_hist: VecDeque<u64>,
@@ -93,13 +98,65 @@ pub struct App {
     pub writer_ips_hist: VecDeque<u64>,
     pub cache_hit_hist: VecDeque<u64>,
     pub cache_miss_hist: VecDeque<u64>,
-    last_disk_read: Option<u64>,
-    last_disk_write: Option<u64>,
-    last_disk_read_ops: Option<u64>,
-    last_disk_write_ops: Option<u64>,
-    last_cached: Option<u64>,
-    last_not_cached: Option<u64>,
-    last_stats_at: Option<Instant>,
+    disk_read_rate: RateTracker,
+    disk_write_rate: RateTracker,
+    disk_read_ops_rate: RateTracker,
+    disk_write_ops_rate: RateTracker,
+    cached_rate: RateTracker,
+    not_cached_rate: RateTracker,
+}
+
+/// Turns a cumulative server counter into a smooth per-second rate.
+///
+/// KurrentDB refreshes its `/stats` counters less often than we poll, so a
+/// naive `Δcounter / Δpoll` plots a real rate on the poll where the counter
+/// advances and a zero on every poll in between — a comb with a gap between
+/// every sample. This holds the last rate across no-change polls (and divides
+/// the delta by the real elapsed time since the counter last advanced, so the
+/// rate stays accurate), then decays to zero once the counter is genuinely idle.
+#[derive(Debug, Default)]
+struct RateTracker {
+    /// Latest counter value seen (updated every poll).
+    last_value: u64,
+    /// When the counter last actually advanced.
+    last_change: Option<Instant>,
+    /// Most recently computed rate, held across flat polls.
+    rate: u64,
+    /// Consecutive no-change polls, used to decay an idle counter to zero.
+    holds: u8,
+}
+
+impl RateTracker {
+    /// Polls where the last rate is held before an idle counter decays to zero.
+    /// Bridges a `/stats` refresh interval a few times our poll period.
+    const MAX_HOLDS: u8 = 4;
+
+    fn sample(&mut self, cur: u64, now: Instant) -> u64 {
+        match self.last_change {
+            Some(changed_at) if cur > self.last_value => {
+                let dt = now.duration_since(changed_at).as_secs_f64().max(0.001);
+                self.rate = ((cur - self.last_value) as f64 / dt) as u64;
+                self.last_change = Some(now);
+                self.holds = 0;
+            }
+            Some(_) => {
+                // Counter hasn't advanced: hold the last rate to bridge the gap,
+                // but decay to zero if it stays flat (the source is idle).
+                if self.holds >= Self::MAX_HOLDS {
+                    self.rate = 0;
+                } else {
+                    self.holds += 1;
+                }
+            }
+            None => {
+                // First sample: establish a baseline, no rate yet.
+                self.rate = 0;
+                self.last_change = Some(now);
+            }
+        }
+        self.last_value = cur;
+        self.rate
+    }
 }
 
 impl App {
@@ -122,8 +179,10 @@ impl App {
             last_ops: 0,
             last_tick: Instant::now(),
             active_tab: 0,
+            chart_style: ChartStyle::Lines,
             stats: None,
             cpu_hist: VecDeque::new(),
+            mem_hist: VecDeque::new(),
             disk_read_hist: VecDeque::new(),
             disk_write_hist: VecDeque::new(),
             disk_read_ops_hist: VecDeque::new(),
@@ -132,13 +191,12 @@ impl App {
             writer_ips_hist: VecDeque::new(),
             cache_hit_hist: VecDeque::new(),
             cache_miss_hist: VecDeque::new(),
-            last_disk_read: None,
-            last_disk_write: None,
-            last_disk_read_ops: None,
-            last_disk_write_ops: None,
-            last_cached: None,
-            last_not_cached: None,
-            last_stats_at: None,
+            disk_read_rate: RateTracker::default(),
+            disk_write_rate: RateTracker::default(),
+            disk_read_ops_rate: RateTracker::default(),
+            disk_write_ops_rate: RateTracker::default(),
+            cached_rate: RateTracker::default(),
+            not_cached_rate: RateTracker::default(),
         }
     }
 
@@ -184,33 +242,35 @@ impl App {
         let now = Instant::now();
         push_capped(&mut self.cpu_hist, stats.proc_cpu.clamp(0.0, 100.0) as u64);
 
+        let mem_pct = if stats.sys_total_mem > 0 {
+            (stats.mem_used() as f64 / stats.sys_total_mem as f64 * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        push_capped(&mut self.mem_hist, mem_pct as u64);
+
         // Queue throughput is already a rate reported by the server, so it can
         // be charted directly without a previous sample.
         push_capped(&mut self.reader_ips_hist, stats.reader_items_per_sec.max(0.0) as u64);
         push_capped(&mut self.writer_ips_hist, stats.writer_items_per_sec.max(0.0) as u64);
 
-        // The remaining series are cumulative counters; convert each to a
-        // per-second rate over the interval since the previous poll.
-        if let Some(prev_t) = self.last_stats_at {
-            let dt = now.duration_since(prev_t).as_secs_f64().max(0.001);
-            let rate = |cur: u64, prev: Option<u64>| -> u64 {
-                prev.map(|p| (cur.saturating_sub(p) as f64 / dt) as u64)
-                    .unwrap_or(0)
-            };
-            push_capped(&mut self.disk_read_hist, rate(stats.disk_read_bytes, self.last_disk_read));
-            push_capped(&mut self.disk_write_hist, rate(stats.disk_write_bytes, self.last_disk_write));
-            push_capped(&mut self.disk_read_ops_hist, rate(stats.disk_read_ops, self.last_disk_read_ops));
-            push_capped(&mut self.disk_write_ops_hist, rate(stats.disk_write_ops, self.last_disk_write_ops));
-            push_capped(&mut self.cache_hit_hist, rate(stats.cached_record, self.last_cached));
-            push_capped(&mut self.cache_miss_hist, rate(stats.not_cached_record, self.last_not_cached));
-        }
-        self.last_disk_read = Some(stats.disk_read_bytes);
-        self.last_disk_write = Some(stats.disk_write_bytes);
-        self.last_disk_read_ops = Some(stats.disk_read_ops);
-        self.last_disk_write_ops = Some(stats.disk_write_ops);
-        self.last_cached = Some(stats.cached_record);
-        self.last_not_cached = Some(stats.not_cached_record);
-        self.last_stats_at = Some(now);
+        // The remaining series are cumulative counters; the trackers turn each
+        // into a smooth per-second rate, holding the last value across polls
+        // where KurrentDB hasn't refreshed the counter (avoiding a gap between
+        // every plotted sample).
+        let dr = self.disk_read_rate.sample(stats.disk_read_bytes, now);
+        push_capped(&mut self.disk_read_hist, dr);
+        let dw = self.disk_write_rate.sample(stats.disk_write_bytes, now);
+        push_capped(&mut self.disk_write_hist, dw);
+        let dro = self.disk_read_ops_rate.sample(stats.disk_read_ops, now);
+        push_capped(&mut self.disk_read_ops_hist, dro);
+        let dwo = self.disk_write_ops_rate.sample(stats.disk_write_ops, now);
+        push_capped(&mut self.disk_write_ops_hist, dwo);
+        let ch = self.cached_rate.sample(stats.cached_record, now);
+        push_capped(&mut self.cache_hit_hist, ch);
+        let cm = self.not_cached_rate.sample(stats.not_cached_record, now);
+        push_capped(&mut self.cache_miss_hist, cm);
+
         self.stats = Some(stats);
     }
 
@@ -224,6 +284,13 @@ impl App {
         // Ctrl-C / Ctrl-D quit from anywhere.
         if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')) {
             return Outcome::Quit;
+        }
+
+        // Ctrl-B toggles charts vs bars. Handled before the char insert below so
+        // it never lands in the command buffer.
+        if ctrl && matches!(key.code, KeyCode::Char('b')) {
+            self.chart_style = self.chart_style.toggle();
+            return Outcome::None;
         }
 
         match key.code {
@@ -523,6 +590,56 @@ mod tests {
         assert!(matches!(app.submit(), Outcome::None));
         assert_eq!(app.output.len(), before + 1);
         assert!(app.output.last().unwrap().contains("Unknown command"));
+    }
+
+    #[test]
+    fn cumulative_rate_holds_instead_of_combing_to_zero() {
+        // KurrentDB refreshes its disk counter every other poll, so a naive
+        // delta-per-poll would plot [rate, 0, rate, 0, ...]. The tracker should
+        // hold the rate across the no-change polls, leaving no interior zeros.
+        let mut app = App::new(Metrics::new());
+        // bytes advances on polls 0,2,4,...; repeats on 1,3,5,...
+        let counters = [0u64, 0, 4096, 4096, 8192, 8192, 12288, 12288];
+        for c in counters {
+            app.on_stats(ServerStats {
+                disk_read_bytes: c,
+                ..Default::default()
+            });
+        }
+        let hist: Vec<u64> = app.disk_read_hist.iter().copied().collect();
+        assert_eq!(hist.len(), counters.len());
+        // Once a rate has been established (after the first real advance), no
+        // sample should drop back to zero between updates.
+        let first_rate = hist.iter().position(|&v| v > 0).expect("a rate appears");
+        assert!(
+            hist[first_rate..].iter().all(|&v| v > 0),
+            "rate series combed to zero: {hist:?}"
+        );
+    }
+
+    #[test]
+    fn idle_cumulative_counter_decays_to_zero() {
+        // A counter that advances once then stalls forever must not hold a stale
+        // non-zero rate indefinitely.
+        let mut app = App::new(Metrics::new());
+        app.on_stats(ServerStats { disk_read_bytes: 0, ..Default::default() });
+        app.on_stats(ServerStats { disk_read_bytes: 4096, ..Default::default() });
+        for _ in 0..(RateTracker::MAX_HOLDS as usize + 3) {
+            app.on_stats(ServerStats { disk_read_bytes: 4096, ..Default::default() });
+        }
+        assert_eq!(app.disk_read_hist.back().copied(), Some(0));
+    }
+
+    #[test]
+    fn ctrl_b_toggles_chart_style_without_typing() {
+        let mut app = App::new(Metrics::new());
+        assert_eq!(app.chart_style, ChartStyle::Lines);
+        assert!(matches!(app.handle_key(ctrl('b')), Outcome::None));
+        assert_eq!(app.chart_style, ChartStyle::Bars);
+        assert!(matches!(app.handle_key(ctrl('b')), Outcome::None));
+        assert_eq!(app.chart_style, ChartStyle::Lines);
+        // The toggle must never leak into the command buffer.
+        assert!(app.input.is_empty());
     }
 
     #[test]

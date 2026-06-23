@@ -1,10 +1,16 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{BarChart, Block, Borders, Gauge, Paragraph, Sparkline, Tabs};
+use ratatui::widgets::{BarChart, Paragraph, Tabs};
 use ratatui::Frame;
 
 use super::app::{App, DashTab};
+use super::theme::{self, Unit};
+
+/// Time window (seconds) the sparkline buffers span, used to label the x-axis.
+/// Client throughput is sampled every 250ms; server stats every second.
+const CLIENT_WINDOW_S: u64 = 30;
+const SERVER_WINDOW_S: u64 = 120;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let cols = Layout::default()
@@ -22,10 +28,7 @@ fn render_client(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         format!("Client — {}", app.current_flood)
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(Color::Green));
+    let block = theme::widget_block(&title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -45,27 +48,26 @@ fn render_client(frame: &mut Frame, area: Rect, app: &App) {
         kv("errors", &errors.to_string()),
         kv("ops/sec", &now_rate.to_string()),
         kv("p50 / p99", &format!("{:.1} ms / {:.1} ms", app.p50, app.p99)),
-        kv("transferred", &fmt_bytes(app.metrics.total_bytes())),
+        kv("transferred", &theme::fmt_bytes(app.metrics.total_bytes())),
     ];
     frame.render_widget(Paragraph::new(text), rows[0]);
 
     let data: Vec<u64> = app.throughput.iter().copied().collect();
-    let spark = Sparkline::default()
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .title("throughput (ops/sec)"),
-        )
-        .data(&data)
-        .style(Style::default().fg(Color::Cyan));
-    frame.render_widget(spark, rows[1]);
+    theme::draw_series(
+        frame,
+        rows[1],
+        theme::widget_block("throughput"),
+        "ops/sec",
+        theme::C_THROUGHPUT,
+        &data,
+        Unit::Count,
+        CLIENT_WINDOW_S,
+        app.chart_style,
+    );
 }
 
 fn render_server(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("Server — KurrentDB /stats   (Tab ↹ switches)")
-        .border_style(Style::default().fg(Color::LightBlue));
+    let block = theme::widget_block("Server — KurrentDB /stats");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -79,19 +81,21 @@ fn render_server(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Tabs::new(titles)
             .select(app.active_tab)
-            .style(Style::default().fg(Color::DarkGray))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::LightBlue)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .divider(" "),
+            .style(theme::tab_titles_line())
+            .highlight_style(theme::tab_highlight())
+            .divider(Span::styled("│", Style::default().fg(theme::MUTED))),
         rows[0],
     );
 
     let content = rows[1];
     if app.stats.is_none() {
-        frame.render_widget(Paragraph::new("Waiting for server stats…"), content);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "Waiting for server stats…",
+                Style::default().fg(theme::MUTED),
+            )),
+            content,
+        );
         return;
     }
 
@@ -104,43 +108,16 @@ fn render_server(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_system_tab(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(stats) = &app.stats else { return };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // cpu gauge
-            Constraint::Length(3), // mem gauge
-            Constraint::Min(3),    // cpu history
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    let cpu = stats.proc_cpu.clamp(0.0, 100.0) / 100.0;
-    frame.render_widget(
-        Gauge::default()
-            .block(Block::default().borders(Borders::NONE).title("proc CPU"))
-            .gauge_style(Style::default().fg(Color::Red))
-            .ratio(cpu)
-            .label(format!("{:.1}%", stats.proc_cpu)),
-        rows[0],
-    );
+    let cpu: Vec<u64> = app.cpu_hist.iter().copied().collect();
+    chart(frame, rows[0], "CPU", "proc", theme::C_CPU, &cpu, Unit::Percent, app.chart_style);
 
-    let (used, total) = (stats.mem_used(), stats.sys_total_mem);
-    let mem_ratio = if total > 0 {
-        (used as f64 / total as f64).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    frame.render_widget(
-        Gauge::default()
-            .block(Block::default().borders(Borders::NONE).title("system memory"))
-            .gauge_style(Style::default().fg(Color::Magenta))
-            .ratio(mem_ratio)
-            .label(format!("{} / {}", fmt_bytes(used), fmt_bytes(total))),
-        rows[1],
-    );
-
-    let cpu_data: Vec<u64> = app.cpu_hist.iter().copied().collect();
-    spark(frame, rows[2], "proc CPU %", Color::Red, &cpu_data, Fmt::Count);
+    let mem: Vec<u64> = app.mem_hist.iter().copied().collect();
+    chart(frame, rows[1], "Memory", "system", theme::C_MEM, &mem, Unit::Percent, app.chart_style);
 }
 
 fn render_disk_tab(frame: &mut Frame, area: Rect, app: &App) {
@@ -149,11 +126,12 @@ fn render_disk_tab(frame: &mut Frame, area: Rect, app: &App) {
     let read_o: Vec<u64> = app.disk_read_ops_hist.iter().copied().collect();
     let write_o: Vec<u64> = app.disk_write_ops_hist.iter().copied().collect();
 
-    let cells = grid(area, 4);
-    spark(frame, cells[0], "disk read/sec", Color::Yellow, &read_b, Fmt::Bytes);
-    spark(frame, cells[1], "disk write/sec", Color::Green, &write_b, Fmt::Bytes);
-    spark(frame, cells[2], "read ops/sec", Color::Cyan, &read_o, Fmt::Count);
-    spark(frame, cells[3], "write ops/sec", Color::LightMagenta, &write_o, Fmt::Count);
+    let cells = grid_2x2(area);
+    let s = app.chart_style;
+    chart(frame, cells[0], "Disk Read", "B/s", theme::C_DISK_READ, &read_b, Unit::Bytes, s);
+    chart(frame, cells[1], "Disk Write", "B/s", theme::C_DISK_WRITE, &write_b, Unit::Bytes, s);
+    chart(frame, cells[2], "Read Ops", "ops/s", theme::C_THROUGHPUT, &read_o, Unit::Count, s);
+    chart(frame, cells[3], "Write Ops", "ops/s", theme::C_WRITER, &write_o, Unit::Count, s);
 }
 
 fn render_queues_tab(frame: &mut Frame, area: Rect, app: &App) {
@@ -169,8 +147,8 @@ fn render_queues_tab(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
-    spark(frame, rows[0], "reader threads (items/sec)", Color::Cyan, &reader, Fmt::Count);
-    spark(frame, rows[1], "writer threads (items/sec)", Color::Green, &writer, Fmt::Count);
+    chart(frame, rows[0], "Reader", "items/s", theme::C_READER, &reader, Unit::Count, app.chart_style);
+    chart(frame, rows[1], "Writer", "items/s", theme::C_WRITER, &writer, Unit::Count, app.chart_style);
 
     // Top queues by length, charted as a bar chart.
     let stats = app.stats.as_ref();
@@ -182,21 +160,27 @@ fn render_queues_tab(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(name, (_, len, _))| (name.as_str(), *len))
         .collect();
 
+    let block = theme::widget_block("Queue Length");
     if bars.is_empty() {
         frame.render_widget(
-            Paragraph::new("No queue stats.")
-                .block(Block::default().borders(Borders::TOP).title("queue length")),
+            Paragraph::new(Span::styled("No queue stats.", Style::default().fg(theme::MUTED)))
+                .block(block),
             rows[2],
         );
     } else {
         frame.render_widget(
             BarChart::default()
-                .block(Block::default().borders(Borders::TOP).title("queue length"))
+                .block(block)
                 .data(bars.as_slice())
                 .bar_width(7)
                 .bar_gap(1)
-                .bar_style(Style::default().fg(Color::LightBlue))
-                .value_style(Style::default().add_modifier(Modifier::BOLD)),
+                .bar_style(Style::default().fg(theme::C_BARS))
+                .value_style(
+                    Style::default()
+                        .fg(ratatui::style::Color::Black)
+                        .bg(theme::C_BARS)
+                        .add_modifier(Modifier::BOLD),
+                ),
             rows[2],
         );
     }
@@ -211,73 +195,61 @@ fn render_cache_tab(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    spark(frame, rows[0], "read-index cache hits/sec", Color::Green, &hits, Fmt::Count);
-    spark(frame, rows[1], "read-index cache misses/sec", Color::Red, &misses, Fmt::Count);
+    chart(frame, rows[0], "Cache Hits", "rec/s", theme::C_CACHE_HIT, &hits, Unit::Count, app.chart_style);
+    chart(frame, rows[1], "Cache Misses", "rec/s", theme::C_CACHE_MISS, &misses, Unit::Count, app.chart_style);
 }
 
-/// How to render the latest-value annotation in a sparkline title.
-#[derive(Clone, Copy)]
-enum Fmt {
-    Bytes,
-    Count,
-}
-
-/// Split `area` into `n` equal vertical rows.
-fn grid(area: Rect, n: usize) -> std::rc::Rc<[Rect]> {
-    let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Ratio(1, n as u32)).collect();
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area)
-}
-
-/// Render a top-bordered sparkline whose title shows the most recent value.
-fn spark(frame: &mut Frame, area: Rect, label: &str, color: Color, data: &[u64], fmt: Fmt) {
-    let latest = data.last().copied().unwrap_or(0);
-    let shown = match fmt {
-        Fmt::Bytes => fmt_bytes(latest),
-        Fmt::Count => latest.to_string(),
-    };
-    frame.render_widget(
-        Sparkline::default()
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .title(format!("{label} ({shown})")),
-            )
-            .data(data)
-            .style(Style::default().fg(color)),
+/// Render a titled, rounded-border server-stats series in the active style.
+#[allow(clippy::too_many_arguments)]
+fn chart(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    label: &str,
+    color: ratatui::style::Color,
+    data: &[u64],
+    unit: Unit,
+    style: theme::ChartStyle,
+) {
+    theme::draw_series(
+        frame,
         area,
+        theme::widget_block(title),
+        label,
+        color,
+        data,
+        unit,
+        SERVER_WINDOW_S,
+        style,
     );
+}
+
+/// Split `area` into a 2x2 grid of equal cells.
+fn grid_2x2(area: Rect) -> Vec<Rect> {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let mut cells = Vec::with_capacity(4);
+    for row in rows.iter() {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(*row);
+        cells.push(cols[0]);
+        cells.push(cols[1]);
+    }
+    cells
 }
 
 fn kv<'a>(key: &'a str, value: &str) -> Line<'a> {
     Line::from(vec![
-        Span::styled(
-            format!("{key:>12}: "),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(value.to_string(), Style::default().fg(Color::White)),
+        Span::styled(format!("{key:>12}: "), Style::default().fg(theme::MUTED)),
+        Span::styled(value.to_string(), Style::default().fg(ratatui::style::Color::White)),
     ])
 }
 
 /// Shorten a queue name for the bar chart label.
 fn short(name: &str) -> String {
-    let trimmed: String = name.chars().take(7).collect();
-    trimmed
-}
-
-fn fmt_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    name.chars().take(7).collect()
 }
