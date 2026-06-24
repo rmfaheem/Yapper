@@ -152,7 +152,7 @@ fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
 mod render_tests {
     use super::*;
     use crate::metrics::Metrics;
-    use crate::stats::ServerStats;
+    use crate::stats::{QueueStat, ServerStats};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -173,7 +173,19 @@ mod render_tests {
         app.stats = Some(ServerStats {
             sys_total_mem: 16 * 1024 * 1024 * 1024,
             sys_free_mem: 9 * 1024 * 1024 * 1024,
-            queues: vec![("Writer".into(), 12, 8.0), ("Reader".into(), 3, 2.0)],
+            reader_queue_peak: 7,
+            writer_queue_peak: 31,
+            tcp_connections: 42,
+            queues: vec![
+                QueueStat {
+                    name: "persistentSubscriptions".into(),
+                    length_current_try_peak: 55,
+                },
+                QueueStat {
+                    name: "Writer".into(),
+                    length_current_try_peak: 31,
+                },
+            ],
             ..Default::default()
         });
 
@@ -188,6 +200,60 @@ mod render_tests {
         println!("=== BARS ===\n{}", terminal.backend());
 
         assert_eq!(terminal.backend().buffer().area.width, 120);
+    }
+
+    /// The Client panel folds the running job's current stage into its status line.
+    #[test]
+    fn client_status_shows_current_stage() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(Metrics::new());
+        app.flood_running = true;
+        app.current_flood = "psub flood -n 2".into();
+        app.current_stage = "Subscribing 4 consumer(s) (ack-mode Ack)…".into();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        // The trailing detail may be clipped at the panel width; the stage prefix
+        // is what matters for the "what stage are we at" status.
+        let dump = format!("{}", terminal.backend());
+        assert!(
+            dump.contains("running — Subscribing 4 consumer"),
+            "status line missing stage:\n{dump}"
+        );
+    }
+
+    /// Smoke-render the Subs and Conns tabs so they can be eyeballed (--nocapture)
+    /// and to guard against layout panics on the new tabs.
+    #[test]
+    fn subs_and_conns_tabs_render() {
+        let mut app = App::new(Metrics::new());
+        for i in 0..60u64 {
+            app.psub_peak_hist.push_back((i * 3) % 120);
+            app.reader_peak_hist.push_back((i * 2) % 50);
+            app.writer_peak_hist.push_back((i * 5) % 90);
+            app.conn_hist.push_back(10 + (i % 25));
+            app.tcp_recv_hist.push_back((i * 1024 * 7) % (2 * 1024 * 1024));
+            app.tcp_send_hist.push_back((i * 1024 * 3) % (1024 * 1024));
+        }
+        app.stats = Some(ServerStats {
+            reader_queue_peak: 7,
+            writer_queue_peak: 31,
+            tcp_connections: 23,
+            queues: vec![
+                QueueStat { name: "persistentSubscriptions".into(), length_current_try_peak: 55 },
+                QueueStat { name: "Subscriptions".into(), length_current_try_peak: 4 },
+            ],
+            ..Default::default()
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        for (tab, name) in [(2, "QUEUES"), (3, "SUBS"), (4, "CONNS")] {
+            app.active_tab = tab;
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            println!("=== {name} ===\n{}", terminal.backend());
+        }
     }
 
     /// Dump the Disk tab in bars mode so the y/x scales on bar charts can be
@@ -212,7 +278,11 @@ mod render_tests {
 }
 
 const HELP_TEXT: &str = "\
-The dashboard is always live above. Just type a command and press Enter.
+The dashboard is always live above. Type a command and press Enter — the same
+commands work on the `yapper` CLI (e.g. `yapper write flood -c 8`).
+
+Each command runs in single mode by default; append `flood` for many concurrent
+clients. `-c/--clients` is a flood-only flag (single mode is always one client).
 
 Commands:
 
@@ -220,22 +290,52 @@ Commands:
   clear              Clear the console log
   quit / exit        Quit Yapper
 
-  wrfl [flags]       Write flood
-  rdfl [flags]       Read flood
+  write [flood]      Append one event (-s stream -e data -t type -f file),
+                       or `write flood` for a multi-client write load test
+  read  [flood]      Read one stream (-s stream -n count -b backwards),
+                       or `read flood` to page through $all under load
+  csub  [flood]      Catch-up subscribe / live tail (-s stream, default $all),
+                       or `csub flood` for many concurrent readers
+  psub  [flood]      Persistent subscribe (-s stream -g group --create --keep),
+                       or `psub flood` for many groups × competing clients
 
-  Flood flags:
-    -c, --clients <n>        Number of concurrent clients
-    -r, --requests <n>       Requests per client (wrfl: events per stream)
-    -s, --streams <n>        Streams per client (wrfl only)
-    -e, --event-size <n>     Event payload size in bytes (wrfl only)
+  write/read flood flags:
+    -c, --clients <n>        Concurrent clients (default 4)
+    -r, --requests <n>       Requests per client (write: events per stream)
+    -s, --streams <n>        Streams per client (write only)
+    -e, --event-size <n>     Event payload size in bytes (write only)
     -b, --batch-size <n>     Batch / page size
     -p, --stream-prefix <s>  Prefix for generated streams
 
-  Examples:
-    wrfl -c 4 -r 1000 -s 10 -e 50 -b 5 -p yap
-    rdfl -c 4 -r 200 -b 100
+  csub flood flags:
+    -c, --clients <n>        Concurrent catch-up subscribers (default 4)
+    -s, --stream <s>         Stream to read ($all tails everything)
+    -d, --duration <secs>    Run for N seconds (0 = until you quit)
 
-Server dashboard tabs: System · Disk · Queues · Cache
+  psub flood flags:
+    -n, --subscriptions <n>  Subscription groups (one per stream {prefix}{i})
+    -c, --clients <n>        Competing consumers per group (default 4)
+        --ack-mode <m>       ack | nack | mix | none
+        --nack-action <a>    park | retry | skip | stop (default park)
+    -g, --group <s>          Group name (default yapper)
+    -p, --stream-prefix <s>  Stream prefix (default yapper-ps-)
+        --create-streams     Populate streams first if missing/empty
+        --stream-length <n>  Events per stream when creating (default 10000)
+    -e, --event-size <n>     Payload size when creating (default 64)
+    -d, --duration <secs>    Run for N seconds (0 = until you quit)
+        --keep               Keep groups on exit (don't delete)
+  Persistent-sub groups are unsubscribed and deleted on exit unless --keep.
+
+  Examples:
+    write -s orders -e '{\"id\":1}' -t OrderPlaced
+    write flood -c 8 -r 1000 -s 10 -e 50 -b 5 -p yap
+    read flood -c 4 -r 200 -b 100
+    csub flood -c 4 -d 60
+    psub flood -n 4 -c 3 --create-streams --stream-length 50000 --ack-mode mix -d 120
+
+Server dashboard tabs: System · Disk · Queues · Subs · Conns · Cache
+  Subs  = persistent subscriptions (per-group peak backlog)
+  Conns = TCP connection count + send/receive throughput
   Tab ↹ next tab · Shift+Tab previous tab
 
 View:     Ctrl+B toggles line charts vs sparkline bars

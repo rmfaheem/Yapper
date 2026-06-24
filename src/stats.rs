@@ -1,6 +1,17 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+/// One KurrentDB processing queue, as reported under `/stats` `es-queue`.
+#[derive(Debug, Clone, Default)]
+pub struct QueueStat {
+    /// Queue name (e.g. `storageReaderQueue`, `persistentSubscriptions`).
+    pub name: String,
+    /// Peak length reached during the current measurement cycle — the most
+    /// useful backlog signal, since the instantaneous `length` is sampled too
+    /// coarsely to catch transient pile-ups.
+    pub length_current_try_peak: u64,
+}
+
 /// A snapshot of a KurrentDB node's server-side statistics, distilled from the
 /// HTTP `/stats` endpoint into just the fields the dashboard charts.
 #[derive(Debug, Clone, Default)]
@@ -23,12 +34,32 @@ pub struct ServerStats {
     pub reader_items_per_sec: f64,
     /// Storage writer queue throughput, items/second.
     pub writer_items_per_sec: f64,
+    /// Storage reader queue peak backlog this cycle (`lengthCurrentTryPeak`).
+    pub reader_queue_peak: u64,
+    /// Storage writer queue peak backlog this cycle (`lengthCurrentTryPeak`).
+    pub writer_queue_peak: u64,
     /// Cumulative read-index record cache hits.
     pub cached_record: u64,
     /// Cumulative read-index record cache misses.
     pub not_cached_record: u64,
-    /// Per-queue `(name, length, avg_items_per_second)`.
-    pub queues: Vec<(String, u64, f64)>,
+    /// Current number of TCP connections.
+    pub tcp_connections: u64,
+    /// TCP receive throughput, bytes/second.
+    pub tcp_receiving_speed: f64,
+    /// TCP send throughput, bytes/second.
+    pub tcp_sending_speed: f64,
+    /// Every processing queue reported under `es-queue`, hottest peak first.
+    pub queues: Vec<QueueStat>,
+}
+
+impl ServerStats {
+    /// Queues whose name looks like a persistent-subscription queue.
+    pub fn persistent_sub_queues(&self) -> impl Iterator<Item = &QueueStat> {
+        self.queues.iter().filter(|q| {
+            let n = q.name.to_lowercase();
+            n.contains("persistent") || n.contains("subscription")
+        })
+    }
 }
 
 impl ServerStats {
@@ -49,23 +80,35 @@ impl ServerStats {
                 .unwrap_or(0.0),
             writer_items_per_sec: get_f64(v, "es-queue-storageWriterQueue-avgItemsPerSecond")
                 .unwrap_or(0.0),
+            reader_queue_peak: get_u64(v, "es-queue-storageReaderQueue-lengthCurrentTryPeak")
+                .unwrap_or(0),
+            writer_queue_peak: get_u64(v, "es-queue-storageWriterQueue-lengthCurrentTryPeak")
+                .unwrap_or(0),
             cached_record: get_u64(v, "es-readIndex-cachedRecord").unwrap_or(0),
             not_cached_record: get_u64(v, "es-readIndex-notCachedRecord").unwrap_or(0),
+            tcp_connections: get_u64(v, "proc-tcp-connections").unwrap_or(0),
+            tcp_receiving_speed: get_f64(v, "proc-tcp-receivingSpeed").unwrap_or(0.0),
+            tcp_sending_speed: get_f64(v, "proc-tcp-sendingSpeed").unwrap_or(0.0),
             queues: Vec::new(),
         };
 
-        // Queues live under es.queue (nested) as an object of name -> { length, avgItemsPerSecond }.
+        // Queues live under es.queue (nested) as an object of
+        // name -> { length, lengthCurrentTryPeak, avgItemsPerSecond }.
         if let Some(Value::Object(queues)) = nested(v, "es-queue") {
             for (name, q) in queues {
-                let len = q.get("length").and_then(Value::as_u64).unwrap_or(0);
-                let rate = q
-                    .get("avgItemsPerSecond")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                stats.queues.push((name.clone(), len, rate));
+                stats.queues.push(QueueStat {
+                    name: name.clone(),
+                    length_current_try_peak: q
+                        .get("lengthCurrentTryPeak")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                });
             }
-            // Stable, descending by length so the dashboard shows hot queues first.
-            stats.queues.sort_by(|a, b| b.1.cmp(&a.1));
+            // Stable, descending by peak backlog so the dashboard shows the
+            // queues under the most pressure first.
+            stats
+                .queues
+                .sort_by(|a, b| b.length_current_try_peak.cmp(&a.length_current_try_peak));
         }
 
         stats
@@ -154,15 +197,17 @@ mod tests {
                 "diskIo": {
                     "readBytes": 1000u64, "writtenBytes": 2000u64,
                     "readOps": 30u64, "writeOps": 40u64
-                }
+                },
+                "tcp": { "connections": 17u64, "receivingSpeed": 1234.0, "sendingSpeed": 5678.0 }
             },
             "sys": { "totalMem": 9_000_000u64, "freeMem": 3_000_000u64 },
             "es": {
                 "queue": {
-                    "index Committer": { "length": 5u64, "avgItemsPerSecond": 1.5 },
-                    "Writer": { "length": 12u64, "avgItemsPerSecond": 8.0 },
-                    "storageReaderQueue": { "length": 0u64, "avgItemsPerSecond": 3.5 },
-                    "storageWriterQueue": { "length": 0u64, "avgItemsPerSecond": 6.0 }
+                    "index Committer": { "length": 5u64, "lengthCurrentTryPeak": 9u64, "avgItemsPerSecond": 1.5 },
+                    "Writer": { "length": 12u64, "lengthCurrentTryPeak": 40u64, "avgItemsPerSecond": 8.0 },
+                    "storageReaderQueue": { "length": 0u64, "lengthCurrentTryPeak": 7u64, "avgItemsPerSecond": 3.5 },
+                    "storageWriterQueue": { "length": 0u64, "lengthCurrentTryPeak": 13u64, "avgItemsPerSecond": 6.0 },
+                    "persistentSubscriptions": { "length": 2u64, "lengthCurrentTryPeak": 55u64, "avgItemsPerSecond": 4.0 }
                 },
                 "readIndex": { "cachedRecord": 7000u64, "notCachedRecord": 11u64 }
             }
@@ -176,14 +221,22 @@ mod tests {
         assert_eq!(stats.disk_write_ops, 40);
         assert_eq!(stats.reader_items_per_sec, 3.5);
         assert_eq!(stats.writer_items_per_sec, 6.0);
+        assert_eq!(stats.reader_queue_peak, 7);
+        assert_eq!(stats.writer_queue_peak, 13);
         assert_eq!(stats.cached_record, 7000);
         assert_eq!(stats.not_cached_record, 11);
         assert_eq!(stats.sys_total_mem, 9_000_000);
         assert_eq!(stats.mem_used(), 6_000_000);
-        // Sorted descending by length: Writer (12) before the others.
-        assert_eq!(stats.queues.len(), 4);
-        assert_eq!(stats.queues[0].0, "Writer");
-        assert_eq!(stats.queues[0].1, 12);
+        assert_eq!(stats.tcp_connections, 17);
+        assert_eq!(stats.tcp_receiving_speed, 1234.0);
+        assert_eq!(stats.tcp_sending_speed, 5678.0);
+        // Sorted descending by peak backlog: persistentSubscriptions (55) first.
+        assert_eq!(stats.queues.len(), 5);
+        assert_eq!(stats.queues[0].name, "persistentSubscriptions");
+        assert_eq!(stats.queues[0].length_current_try_peak, 55);
+        // The persistent-subscription queue is detected by name.
+        let psubs: Vec<&str> = stats.persistent_sub_queues().map(|q| q.name.as_str()).collect();
+        assert_eq!(psubs, ["persistentSubscriptions"]);
     }
 
     /// Also accepts the flat dotted-key format used by older versions / $stats events.

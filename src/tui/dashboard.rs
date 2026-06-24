@@ -40,10 +40,15 @@ fn render_client(frame: &mut Frame, area: Rect, app: &App) {
     let ops = app.metrics.total_ops();
     let errors = app.metrics.total_errors();
     let now_rate = app.throughput.back().copied().unwrap_or(0);
-    let status = if app.flood_running { "running" } else { "idle" };
+    // While a job runs, the status doubles as the current-stage indicator.
+    let status = match (app.flood_running, app.current_stage.as_str()) {
+        (false, _) => "idle".to_string(),
+        (true, "") => "running".to_string(),
+        (true, stage) => format!("running — {}", stage.trim_end_matches('…')),
+    };
 
     let text = vec![
-        kv("status", status),
+        kv("status", &status),
         kv("ops", &ops.to_string()),
         kv("errors", &errors.to_string()),
         kv("ops/sec", &now_rate.to_string()),
@@ -103,6 +108,8 @@ fn render_server(frame: &mut Frame, area: Rect, app: &App) {
         DashTab::System => render_system_tab(frame, content, app),
         DashTab::Disk => render_disk_tab(frame, content, app),
         DashTab::Queues => render_queues_tab(frame, content, app),
+        DashTab::Subs => render_subs_tab(frame, content, app),
+        DashTab::Conns => render_conns_tab(frame, content, app),
         DashTab::Cache => render_cache_tab(frame, content, app),
     }
 }
@@ -137,53 +144,93 @@ fn render_disk_tab(frame: &mut Frame, area: Rect, app: &App) {
 fn render_queues_tab(frame: &mut Frame, area: Rect, app: &App) {
     let reader: Vec<u64> = app.reader_ips_hist.iter().copied().collect();
     let writer: Vec<u64> = app.writer_ips_hist.iter().copied().collect();
+    let reader_peak: Vec<u64> = app.reader_peak_hist.iter().copied().collect();
+    let writer_peak: Vec<u64> = app.writer_peak_hist.iter().copied().collect();
+
+    // Throughput on top, peak backlog (lengthCurrentTryPeak) below: the peak is
+    // the useful signal, since the instantaneous queue length is almost always 0.
+    let cells = grid_2x2(area);
+    let s = app.chart_style;
+    chart(frame, cells[0], "Reader", "items/s", theme::C_READER, &reader, Unit::Count, s);
+    chart(frame, cells[1], "Writer", "items/s", theme::C_WRITER, &writer, Unit::Count, s);
+    chart(frame, cells[2], "Reader Peak", "peak", theme::C_READER, &reader_peak, Unit::Count, s);
+    chart(frame, cells[3], "Writer Peak", "peak", theme::C_WRITER, &writer_peak, Unit::Count, s);
+}
+
+fn render_subs_tab(frame: &mut Frame, area: Rect, app: &App) {
+    let peak: Vec<u64> = app.psub_peak_hist.iter().copied().collect();
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-            Constraint::Ratio(1, 3),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    chart(frame, rows[0], "Reader", "items/s", theme::C_READER, &reader, Unit::Count, app.chart_style);
-    chart(frame, rows[1], "Writer", "items/s", theme::C_WRITER, &writer, Unit::Count, app.chart_style);
+    // Worst peak backlog across all persistent-subscription queues, over time.
+    chart(frame, rows[0], "Persistent Sub Peak", "peak", theme::C_THROUGHPUT, &peak, Unit::Count, app.chart_style);
 
-    // Top queues by length, charted as a bar chart.
-    let stats = app.stats.as_ref();
-    let qs = stats.map(|s| &s.queues[..s.queues.len().min(6)]).unwrap_or(&[]);
-    let names: Vec<String> = qs.iter().map(|(name, _, _)| short(name)).collect();
+    // Current per-queue peak backlog (lengthCurrentTryPeak) as a bar chart.
+    let qs: Vec<_> = app
+        .stats
+        .as_ref()
+        .map(|s| s.persistent_sub_queues().take(6).collect())
+        .unwrap_or_default();
+    let names: Vec<String> = qs.iter().map(|q| short(&q.name)).collect();
     let bars: Vec<(&str, u64)> = names
         .iter()
         .zip(qs.iter())
-        .map(|(name, (_, len, _))| (name.as_str(), *len))
+        .map(|(name, q)| (name.as_str(), q.length_current_try_peak))
         .collect();
 
-    let block = theme::widget_block("Queue Length");
+    let block = theme::widget_block("Queue Peak (per group)");
     if bars.is_empty() {
         frame.render_widget(
-            Paragraph::new(Span::styled("No queue stats.", Style::default().fg(theme::MUTED)))
-                .block(block),
-            rows[2],
+            Paragraph::new(Span::styled(
+                "No persistent-subscription queues reported.",
+                Style::default().fg(theme::MUTED),
+            ))
+            .block(block),
+            rows[1],
         );
     } else {
-        frame.render_widget(
-            BarChart::default()
-                .block(block)
-                .data(bars.as_slice())
-                .bar_width(7)
-                .bar_gap(1)
-                .bar_style(Style::default().fg(theme::C_BARS))
-                .value_style(
-                    Style::default()
-                        .fg(ratatui::style::Color::Black)
-                        .bg(theme::C_BARS)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            rows[2],
-        );
+        frame.render_widget(queue_bar_chart(block, &bars), rows[1]);
     }
+}
+
+fn render_conns_tab(frame: &mut Frame, area: Rect, app: &App) {
+    let conns: Vec<u64> = app.conn_hist.iter().copied().collect();
+    let recv: Vec<u64> = app.tcp_recv_hist.iter().copied().collect();
+    let send: Vec<u64> = app.tcp_send_hist.iter().copied().collect();
+
+    // Connection count spans the top; send/receive throughput share the bottom.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let bottom = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+
+    let s = app.chart_style;
+    chart(frame, rows[0], "Connections", "conns", theme::C_MEM, &conns, Unit::Count, s);
+    chart(frame, bottom[0], "TCP Recv", "B/s", theme::C_DISK_READ, &recv, Unit::Bytes, s);
+    chart(frame, bottom[1], "TCP Send", "B/s", theme::C_DISK_WRITE, &send, Unit::Bytes, s);
+}
+
+/// A `bottom`-style bar chart for per-queue values, sharing the dashboard look.
+fn queue_bar_chart<'a>(block: ratatui::widgets::Block<'a>, bars: &'a [(&'a str, u64)]) -> BarChart<'a> {
+    BarChart::default()
+        .block(block)
+        .data(bars)
+        .bar_width(7)
+        .bar_gap(1)
+        .bar_style(Style::default().fg(theme::C_BARS))
+        .value_style(
+            Style::default()
+                .fg(ratatui::style::Color::Black)
+                .bg(theme::C_BARS)
+                .add_modifier(Modifier::BOLD),
+        )
 }
 
 fn render_cache_tab(frame: &mut Frame, area: Rect, app: &App) {

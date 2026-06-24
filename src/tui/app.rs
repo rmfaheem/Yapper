@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::db::FloodParams;
+use crate::cli::Job;
 use crate::metrics::Metrics;
 use crate::stats::ServerStats;
 
@@ -19,15 +19,19 @@ pub enum DashTab {
     System,
     Disk,
     Queues,
+    Subs,
+    Conns,
     Cache,
 }
 
 impl DashTab {
     /// All tabs, in display order.
-    pub const ALL: [DashTab; 4] = [
+    pub const ALL: [DashTab; 6] = [
         DashTab::System,
         DashTab::Disk,
         DashTab::Queues,
+        DashTab::Subs,
+        DashTab::Conns,
         DashTab::Cache,
     ];
 
@@ -36,6 +40,8 @@ impl DashTab {
             DashTab::System => "System",
             DashTab::Disk => "Disk",
             DashTab::Queues => "Queues",
+            DashTab::Subs => "Subs",
+            DashTab::Conns => "Conns",
             DashTab::Cache => "Cache",
         }
     }
@@ -47,6 +53,10 @@ pub enum AppEvent {
     Tick,
     Stats(ServerStats),
     StatsError(String),
+    /// A line of output from a running job (read results, subscription events).
+    Log(String),
+    /// The running job reached a new stage (shown live + logged).
+    Stage(String),
     FloodFinished(String),
 }
 
@@ -54,7 +64,8 @@ pub enum AppEvent {
 pub enum Outcome {
     None,
     Quit,
-    StartFlood { write: bool, params: FloodParams, label: String },
+    /// Run a parsed command in the background, feeding the dashboard.
+    Run { job: Job, label: String },
 }
 
 pub struct App {
@@ -68,6 +79,8 @@ pub struct App {
     pub metrics: Arc<Metrics>,
     pub flood_running: bool,
     pub current_flood: String,
+    /// Latest stage reported by the running job (e.g. "Subscribing 12 consumers…").
+    pub current_stage: String,
 
     // Command history (most recent last). `history_idx` is the position we're
     // browsing while pressing Up/Down; `None` means we're on the live buffer.
@@ -96,6 +109,12 @@ pub struct App {
     pub disk_write_ops_hist: VecDeque<u64>,
     pub reader_ips_hist: VecDeque<u64>,
     pub writer_ips_hist: VecDeque<u64>,
+    pub reader_peak_hist: VecDeque<u64>,
+    pub writer_peak_hist: VecDeque<u64>,
+    pub psub_peak_hist: VecDeque<u64>,
+    pub conn_hist: VecDeque<u64>,
+    pub tcp_recv_hist: VecDeque<u64>,
+    pub tcp_send_hist: VecDeque<u64>,
     pub cache_hit_hist: VecDeque<u64>,
     pub cache_miss_hist: VecDeque<u64>,
     disk_read_rate: RateTracker,
@@ -171,6 +190,7 @@ impl App {
             metrics,
             flood_running: false,
             current_flood: String::new(),
+            current_stage: String::new(),
             history: Vec::new(),
             history_idx: None,
             throughput: VecDeque::new(),
@@ -189,6 +209,12 @@ impl App {
             disk_write_ops_hist: VecDeque::new(),
             reader_ips_hist: VecDeque::new(),
             writer_ips_hist: VecDeque::new(),
+            reader_peak_hist: VecDeque::new(),
+            writer_peak_hist: VecDeque::new(),
+            psub_peak_hist: VecDeque::new(),
+            conn_hist: VecDeque::new(),
+            tcp_recv_hist: VecDeque::new(),
+            tcp_send_hist: VecDeque::new(),
             cache_hit_hist: VecDeque::new(),
             cache_miss_hist: VecDeque::new(),
             disk_read_rate: RateTracker::default(),
@@ -253,6 +279,21 @@ impl App {
         // be charted directly without a previous sample.
         push_capped(&mut self.reader_ips_hist, stats.reader_items_per_sec.max(0.0) as u64);
         push_capped(&mut self.writer_ips_hist, stats.writer_items_per_sec.max(0.0) as u64);
+
+        // Peak backlog (lengthCurrentTryPeak) is a per-cycle gauge, charted as-is.
+        push_capped(&mut self.reader_peak_hist, stats.reader_queue_peak);
+        push_capped(&mut self.writer_peak_hist, stats.writer_queue_peak);
+        let psub_peak = stats
+            .persistent_sub_queues()
+            .map(|q| q.length_current_try_peak)
+            .max()
+            .unwrap_or(0);
+        push_capped(&mut self.psub_peak_hist, psub_peak);
+
+        // Connection count is a gauge; the TCP speeds are already per-second rates.
+        push_capped(&mut self.conn_hist, stats.tcp_connections);
+        push_capped(&mut self.tcp_recv_hist, stats.tcp_receiving_speed.max(0.0) as u64);
+        push_capped(&mut self.tcp_send_hist, stats.tcp_sending_speed.max(0.0) as u64);
 
         // The remaining series are cumulative counters; the trackers turn each
         // into a smooth per-second rate, holding the last value across polls
@@ -402,9 +443,10 @@ impl App {
             self.history.push(line.clone());
         }
 
-        let mut parts = line.split_whitespace();
-        let cmd = parts.next().unwrap_or("");
-        match cmd {
+        // `help`/`clear`/`quit` are TUI-only meta commands; everything else goes
+        // through the same clap grammar the CLI uses, so the two front-ends stay
+        // in lock-step.
+        match line.split_whitespace().next().unwrap_or("") {
             "help" => {
                 self.show_help = true;
                 Outcome::None
@@ -414,18 +456,28 @@ impl App {
                 Outcome::None
             }
             "quit" | "exit" => Outcome::Quit,
-            "wrfl" | "rdfl" => {
-                let write = cmd == "wrfl";
-                let params = parse_flood(&line, write);
-                self.push_log(format!("> {line}"));
-                Outcome::StartFlood {
-                    write,
-                    params,
-                    label: line,
+            _ => self.run_command(line),
+        }
+    }
+
+    /// Parse a data command with the shared grammar and turn it into a job to run.
+    fn run_command(&mut self, line: String) -> Outcome {
+        match crate::cli::parse_command_line(&line) {
+            Ok(command) => match crate::cli::build_job(command) {
+                Ok(job) => {
+                    self.push_log(format!("> {line}"));
+                    Outcome::Run { job, label: line }
                 }
-            }
-            _ => {
-                self.push_log(format!("Unknown command: {line}"));
+                Err(e) => {
+                    self.push_log(format!("error: {e}"));
+                    Outcome::None
+                }
+            },
+            // clap renders parse errors (and --help) as multi-line text.
+            Err(msg) => {
+                for l in msg.lines() {
+                    self.push_log(l.to_string());
+                }
                 Outcome::None
             }
         }
@@ -437,50 +489,6 @@ fn push_capped(buf: &mut VecDeque<u64>, value: u64) {
         buf.pop_front();
     }
     buf.push_back(value);
-}
-
-/// Parse a `wrfl`/`rdfl` command line into FloodParams. Unknown flags are ignored;
-/// missing flags fall back to sensible defaults.
-fn parse_flood(line: &str, write: bool) -> FloodParams {
-    let mut params = FloodParams {
-        clients: 1,
-        requests: 1,
-        streams: 1,
-        event_size: 10,
-        batch_size: if write { 1 } else { 100 },
-        stream_prefix: String::new(),
-    };
-
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    let mut i = 1; // skip the command word
-    while i < tokens.len() {
-        let flag = tokens[i];
-        let value = tokens.get(i + 1).copied();
-        let mut consumed_value = true;
-        match flag {
-            "-c" | "--clients" => set_usize(&mut params.clients, value),
-            "-r" | "--requests" => set_usize(&mut params.requests, value),
-            "-s" | "--streams" => set_usize(&mut params.streams, value),
-            "-e" | "--event-size" => set_usize(&mut params.event_size, value),
-            "-b" | "--batch-size" => set_usize(&mut params.batch_size, value),
-            "-p" | "--stream-prefix" => {
-                if let Some(v) = value {
-                    params.stream_prefix = v.to_string();
-                }
-            }
-            _ => consumed_value = false,
-        }
-        i += if consumed_value && value.is_some() { 2 } else { 1 };
-    }
-    params
-}
-
-fn set_usize(target: &mut usize, value: Option<&str>) {
-    if let Some(v) = value {
-        if let Ok(n) = v.parse::<usize>() {
-            *target = n;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -502,48 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_flood_write_defaults() {
-        let p = parse_flood("wrfl", true);
-        assert_eq!(p.clients, 1);
-        assert_eq!(p.requests, 1);
-        assert_eq!(p.streams, 1);
-        assert_eq!(p.event_size, 10);
-        assert_eq!(p.batch_size, 1); // write default
-        assert_eq!(p.stream_prefix, "");
-    }
-
-    #[test]
-    fn parse_flood_read_default_batch_is_100() {
-        let p = parse_flood("rdfl", false);
-        assert_eq!(p.batch_size, 100);
-    }
-
-    #[test]
-    fn parse_flood_all_short_flags() {
-        let p = parse_flood("wrfl -c 4 -r 1000 -s 10 -e 50 -b 5 -p yap", true);
-        assert_eq!(p.clients, 4);
-        assert_eq!(p.requests, 1000);
-        assert_eq!(p.streams, 10);
-        assert_eq!(p.event_size, 50);
-        assert_eq!(p.batch_size, 5);
-        assert_eq!(p.stream_prefix, "yap");
-    }
-
-    #[test]
-    fn parse_flood_long_flags_and_unknown_are_ignored() {
-        let p = parse_flood("rdfl --clients 8 --requests 3 --bogus zzz -p pre", false);
-        assert_eq!(p.clients, 8);
-        assert_eq!(p.requests, 3);
-        assert_eq!(p.stream_prefix, "pre");
-    }
-
-    #[test]
-    fn parse_flood_invalid_number_keeps_default() {
-        let p = parse_flood("wrfl -c notanumber", true);
-        assert_eq!(p.clients, 1);
-    }
-
-    #[test]
     fn submit_clear_empties_output() {
         let mut app = App::new(Metrics::new());
         app.push_log("noise");
@@ -561,17 +527,29 @@ mod tests {
     }
 
     #[test]
-    fn submit_wrfl_starts_write_flood() {
+    fn submit_write_flood_starts_run() {
+        // The TUI shares the CLI grammar; a valid command yields a runnable job.
         let mut app = App::new(Metrics::new());
-        app.set_input("wrfl -c 2 -r 5".to_string());
+        app.set_input("write flood -c 2 -r 5".to_string());
         match app.submit() {
-            Outcome::StartFlood { write, params, label } => {
-                assert!(write);
-                assert_eq!(params.clients, 2);
-                assert_eq!(params.requests, 5);
-                assert_eq!(label, "wrfl -c 2 -r 5");
+            Outcome::Run { job, label } => {
+                assert!(matches!(job, Job::WriteFlood(_)));
+                assert_eq!(label, "write flood -c 2 -r 5");
             }
-            _ => panic!("expected StartFlood"),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn submit_psub_flood_starts_run() {
+        let mut app = App::new(Metrics::new());
+        app.set_input("psub flood -n 2 -c 3 --ack-mode none".to_string());
+        match app.submit() {
+            Outcome::Run { job, label } => {
+                assert!(matches!(job, Job::PsubFlood { .. }));
+                assert_eq!(label, "psub flood -n 2 -c 3 --ack-mode none");
+            }
+            _ => panic!("expected Run"),
         }
     }
 
@@ -583,13 +561,21 @@ mod tests {
     }
 
     #[test]
-    fn submit_unknown_logs_a_line() {
+    fn submit_unknown_logs_and_does_not_run() {
         let mut app = App::new(Metrics::new());
         let before = app.output.len();
         app.set_input("frobnicate".to_string());
         assert!(matches!(app.submit(), Outcome::None));
-        assert_eq!(app.output.len(), before + 1);
-        assert!(app.output.last().unwrap().contains("Unknown command"));
+        // The clap error is logged (at least one line), nothing is run.
+        assert!(app.output.len() > before);
+    }
+
+    #[test]
+    fn submit_clients_in_single_mode_is_rejected() {
+        // `-c` only exists under `flood`; single mode must not start a run.
+        let mut app = App::new(Metrics::new());
+        app.set_input("write -c 4".to_string());
+        assert!(matches!(app.submit(), Outcome::None));
     }
 
     #[test]
@@ -693,8 +679,8 @@ mod tests {
         let mut app = App::new(Metrics::new());
         assert_eq!(app.active_tab, 0);
 
-        // Tab advances and wraps around all four tabs.
-        for expected in [1, 2, 3, 0] {
+        // Tab advances and wraps around all tabs.
+        for expected in [1, 2, 3, 4, 5, 0] {
             let _ = app.handle_key(key(KeyCode::Tab));
             assert_eq!(app.active_tab, expected);
         }
