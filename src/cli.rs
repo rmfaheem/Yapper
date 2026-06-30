@@ -4,10 +4,35 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::config;
-use crate::db::{AckMode, Db, FloodParams, NackAction, Reporter, SubFloodParams};
+use crate::db::{
+    AckMode, CatchupFloodParams, Db, FloodParams, NackAction, Reporter, SubFloodParams,
+};
 use crate::metrics::Metrics;
 use crate::tui;
+
+/// Run `fut` to completion, but cancel `cancel` on Ctrl-C so the operation can
+/// tear down anything it created and return gracefully — rather than being
+/// dropped mid-flight (which would skip its cleanup).
+async fn with_ctrl_c_cancel<F>(cancel: CancellationToken, fut: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    let watcher = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                println!("\nCancelling… cleaning up…");
+                cancel.cancel();
+            }
+        })
+    };
+    let res = fut.await;
+    watcher.abort();
+    res
+}
 
 /// A reporter that prints each stage to stdout, for the CLI front-end.
 fn stdout_reporter() -> Reporter {
@@ -121,6 +146,9 @@ pub struct WriteFloodArgs {
     /// Prefix for generated stream names
     #[arg(short = 'p', long = "stream-prefix", default_value = "")]
     pub stream_prefix: String,
+    /// Run for this many seconds instead of stopping after --requests (0 = use --requests)
+    #[arg(short = 'd', long = "duration", default_value_t = 0)]
+    pub duration: u64,
 }
 
 // --- read ----------------------------------------------------------------
@@ -160,6 +188,9 @@ pub struct ReadFloodArgs {
     /// Stream prefix (reserved; reads page through $all)
     #[arg(short = 'p', long = "stream-prefix", default_value = "")]
     pub stream_prefix: String,
+    /// Run for this many seconds instead of stopping after --requests (0 = use --requests)
+    #[arg(short = 'd', long = "duration", default_value_t = 0)]
+    pub duration: u64,
 }
 
 // --- csub (catch-up subscription) ----------------------------------------
@@ -175,21 +206,36 @@ pub struct CsubArgs {
 
 #[derive(Subcommand)]
 pub enum CsubFlood {
-    /// Run many concurrent catch-up subscribers as a read-load test
+    /// Catch-up read-load test: many concurrent readers across prefixed streams
     Flood(CsubFloodArgs),
 }
 
 #[derive(Args)]
 pub struct CsubFloodArgs {
-    /// Number of concurrent catch-up subscribers
+    /// Number of streams to read (one set of readers per stream {prefix}{i})
+    #[arg(short = 'n', long = "subscriptions", default_value_t = 1)]
+    pub subscriptions: usize,
+    /// Concurrent catch-up readers per stream
     #[arg(short = 'c', long = "clients", default_value_t = DEFAULT_FLOOD_CLIENTS)]
     pub clients: usize,
-    /// Stream to subscribe to ("$all" tails everything)
-    #[arg(short = 's', long = "stream", default_value = "$all")]
-    pub stream: String,
-    /// Run for this many seconds (0 = until Ctrl-C)
+    /// Stream name prefix; streams are {prefix}{i}
+    #[arg(short = 'p', long = "stream-prefix", default_value = "yapper-cs-")]
+    pub stream_prefix: String,
+    /// Populate streams first if missing/empty (otherwise the run aborts)
+    #[arg(long = "create-streams", default_value_t = false)]
+    pub create_streams: bool,
+    /// Events to write per stream when creating
+    #[arg(long = "stream-length", default_value_t = 10_000)]
+    pub stream_length: usize,
+    /// Event payload size in bytes when creating streams
+    #[arg(short = 'e', long = "event-size", default_value_t = 64)]
+    pub event_size: usize,
+    /// Timeout in seconds: stop if the readers haven't caught up first (0 = no timeout)
     #[arg(short = 'd', long = "duration", default_value_t = 0)]
     pub duration: u64,
+    /// Also delete the streams created by --create-streams on a clean exit (kept by default)
+    #[arg(long = "delete-streams", default_value_t = false)]
+    pub delete_streams: bool,
 }
 
 // --- psub (persistent subscription) --------------------------------------
@@ -247,12 +293,15 @@ pub struct PsubFloodArgs {
     /// Event payload size in bytes when creating streams
     #[arg(short = 'e', long = "event-size", default_value_t = 64)]
     pub event_size: usize,
-    /// Run for this many seconds (0 = until Ctrl-C)
+    /// Timeout in seconds: stop if the streams haven't drained first (0 = no timeout)
     #[arg(short = 'd', long = "duration", default_value_t = 0)]
     pub duration: u64,
-    /// Keep subscription groups on exit (don't delete them)
+    /// Keep subscription groups (and created streams) on exit (don't delete them)
     #[arg(long = "keep", default_value_t = false)]
     pub keep: bool,
+    /// Also delete the streams created by --create-streams on a clean exit (kept by default)
+    #[arg(long = "delete-streams", default_value_t = false)]
+    pub delete_streams: bool,
 }
 
 /// A runnable unit of work, produced by parsing a command and executed by
@@ -277,8 +326,7 @@ pub enum Job {
         stream: String,
     },
     CatchupFlood {
-        stream: String,
-        clients: usize,
+        params: CatchupFloodParams,
         duration: u64,
     },
     PsubSingle {
@@ -305,6 +353,7 @@ pub fn build_job(command: Commands) -> Result<Job> {
                 event_size: f.event_size,
                 batch_size: f.batch_size,
                 stream_prefix: f.stream_prefix,
+                duration: f.duration,
             })),
             None => Ok(Job::WriteSingle {
                 stream: a
@@ -323,6 +372,7 @@ pub fn build_job(command: Commands) -> Result<Job> {
                 event_size: 0,
                 batch_size: f.batch_size,
                 stream_prefix: f.stream_prefix,
+                duration: f.duration,
             })),
             None => Ok(Job::ReadSingle {
                 stream: a
@@ -334,8 +384,15 @@ pub fn build_job(command: Commands) -> Result<Job> {
         },
         Commands::Csub(a) => match a.flood {
             Some(CsubFlood::Flood(f)) => Ok(Job::CatchupFlood {
-                stream: f.stream,
-                clients: f.clients,
+                params: CatchupFloodParams {
+                    subscriptions: f.subscriptions,
+                    clients: f.clients,
+                    stream_prefix: f.stream_prefix,
+                    create_streams: f.create_streams,
+                    stream_length: f.stream_length,
+                    event_size: f.event_size,
+                    delete_streams: f.delete_streams,
+                },
                 duration: f.duration,
             }),
             None => Ok(Job::Catchup { stream: a.stream }),
@@ -353,6 +410,7 @@ pub fn build_job(command: Commands) -> Result<Job> {
                     stream_length: f.stream_length,
                     event_size: f.event_size,
                     keep: f.keep,
+                    delete_streams: f.delete_streams,
                 },
                 duration: f.duration,
             }),
@@ -488,19 +546,14 @@ async fn run_job(db: &Db, job: Job) -> Result<()> {
         Job::ReadFlood(params) => run_flood(db, params, false).await,
         Job::Catchup { stream } => {
             println!("Subscribing to '{stream}' (Ctrl-C to stop)...");
-            tokio::select! {
-                res = db.subscribe_catchup(&stream, |line| println!("{line}")) => res,
-                _ = tokio::signal::ctrl_c() => {
-                    println!("\nStopped.");
-                    Ok(())
-                }
-            }
+            let cancel = CancellationToken::new();
+            with_ctrl_c_cancel(
+                cancel.clone(),
+                db.subscribe_catchup(&stream, cancel.clone(), |line| println!("{line}")),
+            )
+            .await
         }
-        Job::CatchupFlood {
-            stream,
-            clients,
-            duration,
-        } => run_catchup_flood(db, &stream, clients, duration).await,
+        Job::CatchupFlood { params, duration } => run_catchup_flood(db, params, duration).await,
         Job::PsubSingle {
             stream,
             group,
@@ -508,13 +561,14 @@ async fn run_job(db: &Db, job: Job) -> Result<()> {
             keep,
         } => {
             println!("Subscribing to '{stream}' / group '{group}' (Ctrl-C to stop)...");
-            tokio::select! {
-                res = db.subscribe_persistent(&stream, &group, create, keep, |line| println!("{line}")) => res,
-                _ = tokio::signal::ctrl_c() => {
-                    println!("\nStopped.");
-                    Ok(())
-                }
-            }
+            let cancel = CancellationToken::new();
+            with_ctrl_c_cancel(
+                cancel.clone(),
+                db.subscribe_persistent(&stream, &group, create, keep, cancel.clone(), |line| {
+                    println!("{line}")
+                }),
+            )
+            .await
         }
         Job::PsubFlood { params, duration } => run_sub_flood(db, params, duration).await,
     }
@@ -525,13 +579,17 @@ async fn run_flood(db: &Db, params: FloodParams, write: bool) -> Result<()> {
     let metrics = Metrics::new();
     let reporter = stdout_reporter();
     let progress = spawn_progress(metrics.clone());
+    let cancel = CancellationToken::new();
 
     let start = Instant::now();
-    let res = if write {
-        db.write_flood(params, metrics.clone(), &reporter).await
-    } else {
-        db.read_flood(params, metrics.clone(), &reporter).await
-    };
+    let res = with_ctrl_c_cancel(cancel.clone(), async {
+        if write {
+            db.write_flood(params, metrics.clone(), &reporter, cancel.clone()).await
+        } else {
+            db.read_flood(params, metrics.clone(), &reporter, cancel.clone()).await
+        }
+    })
+    .await;
     progress.abort();
     res?;
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
@@ -548,19 +606,18 @@ async fn run_flood(db: &Db, params: FloodParams, write: bool) -> Result<()> {
 }
 
 /// Run a catch-up subscription read-load test from the CLI and print a summary.
-async fn run_catchup_flood(db: &Db, stream: &str, clients: usize, duration: u64) -> Result<()> {
+async fn run_catchup_flood(db: &Db, params: CatchupFloodParams, duration: u64) -> Result<()> {
     let metrics = Metrics::new();
     let reporter = stdout_reporter();
     let progress = spawn_progress(metrics.clone());
+    let cancel = CancellationToken::new();
 
     let start = Instant::now();
-    let res = tokio::select! {
-        r = db.catchup_flood(stream, clients, metrics.clone(), duration, &reporter) => r,
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nStopping...");
-            Ok(())
-        }
-    };
+    let res = with_ctrl_c_cancel(
+        cancel.clone(),
+        db.catchup_flood(params, metrics.clone(), duration, &reporter, cancel.clone()),
+    )
+    .await;
     progress.abort();
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
 
@@ -581,13 +638,12 @@ async fn run_sub_flood(db: &Db, params: SubFloodParams, duration: u64) -> Result
     let progress = spawn_progress(metrics.clone());
 
     let start = Instant::now();
-    let res = tokio::select! {
-        r = db.subscribe_flood(params, metrics.clone(), duration, &reporter) => r,
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nStopping...");
-            Ok(())
-        }
-    };
+    let cancel = CancellationToken::new();
+    let res = with_ctrl_c_cancel(
+        cancel.clone(),
+        db.subscribe_flood(params, metrics.clone(), duration, &reporter, cancel.clone()),
+    )
+    .await;
     progress.abort();
     let elapsed = start.elapsed().as_secs_f64().max(0.001);
 
@@ -660,6 +716,23 @@ mod tests {
     }
 
     #[test]
+    fn write_read_flood_duration_is_optional() {
+        // Absent -> 0 (run until --requests); present -> the given seconds.
+        match job("write flood -c 2") {
+            Ok(Job::WriteFlood(p)) => assert_eq!(p.duration, 0),
+            other => panic!("expected WriteFlood, got {other:?}"),
+        }
+        match job("write flood -c 2 -d 45") {
+            Ok(Job::WriteFlood(p)) => assert_eq!(p.duration, 45),
+            other => panic!("expected WriteFlood, got {other:?}"),
+        }
+        match job("read flood -d 10") {
+            Ok(Job::ReadFlood(p)) => assert_eq!(p.duration, 10),
+            other => panic!("expected ReadFlood, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn clients_flag_is_rejected_in_single_mode() {
         // -c only exists under `flood`; in single mode it's an unexpected arg.
         assert!(job("write -c 4").is_err());
@@ -688,15 +761,19 @@ mod tests {
     }
 
     #[test]
-    fn csub_single_defaults_all_and_flood() {
+    fn csub_single_defaults_all_and_flood_mirrors_psub() {
         match job("csub") {
             Ok(Job::Catchup { stream }) => assert_eq!(stream, "$all"),
             other => panic!("expected Catchup, got {other:?}"),
         }
-        match job("csub flood -c 3 -s orders -d 30") {
-            Ok(Job::CatchupFlood { stream, clients, duration }) => {
-                assert_eq!(stream, "orders");
-                assert_eq!(clients, 3);
+        match job("csub flood -n 4 -c 3 -p cs- --create-streams --stream-length 500 -e 32 -d 30") {
+            Ok(Job::CatchupFlood { params, duration }) => {
+                assert_eq!(params.subscriptions, 4);
+                assert_eq!(params.clients, 3);
+                assert_eq!(params.stream_prefix, "cs-");
+                assert!(params.create_streams);
+                assert_eq!(params.stream_length, 500);
+                assert_eq!(params.event_size, 32);
                 assert_eq!(duration, 30);
             }
             other => panic!("expected CatchupFlood, got {other:?}"),

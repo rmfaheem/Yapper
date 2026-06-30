@@ -99,27 +99,34 @@ fn draw_hint_bar(frame: &mut Frame, area: Rect, app: &App) {
     let sep = || Span::styled("   ", Style::default().fg(theme::MUTED));
     let desc = |d: &str| Span::styled(d.to_string(), Style::default().fg(theme::MUTED));
 
-    let line = Line::from(vec![
+    let mut spans = vec![
         key("Tab"),
         desc(" switch panel"),
         sep(),
         key("Ctrl+B"),
         desc(&format!(" view: {}", app.chart_style.label())),
         sep(),
-        key("help"),
-        desc(" commands"),
+        key("Ctrl+H"),
+        desc(" help"),
         sep(),
-        key("Ctrl+C"),
-        desc(" quit"),
-    ])
-    .alignment(Alignment::Center);
+    ];
+    // Surface the cancel key only while a command is running.
+    if app.flood_running {
+        spans.push(key("Esc"));
+        spans.push(desc(" cancel"));
+        spans.push(sep());
+    }
+    spans.push(key("Ctrl+C"));
+    spans.push(desc(" quit"));
+
+    let line = Line::from(spans).alignment(Alignment::Center);
     frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(72, 80, area);
     frame.render_widget(Clear, popup);
-    let block = theme::widget_block("Help — Esc to close");
+    let block = theme::widget_block("Help — Ctrl+H or Esc to close");
     frame.render_widget(
         Paragraph::new(HELP_TEXT)
             .block(block)
@@ -286,8 +293,8 @@ clients. `-c/--clients` is a flood-only flag (single mode is always one client).
 
 Commands:
 
-  help               Show this help overlay
   clear              Clear the console log
+  stop / cancel      Gracefully stop the running command (same as Esc)
   quit / exit        Quit Yapper
 
   write [flood]      Append one event (-s stream -e data -t type -f file),
@@ -306,11 +313,18 @@ Commands:
     -e, --event-size <n>     Event payload size in bytes (write only)
     -b, --batch-size <n>     Batch / page size
     -p, --stream-prefix <s>  Prefix for generated streams
+    -d, --duration <secs>    Run for N seconds of sustained load (ignores --requests)
 
-  csub flood flags:
-    -c, --clients <n>        Concurrent catch-up subscribers (default 4)
-    -s, --stream <s>         Stream to read ($all tails everything)
-    -d, --duration <secs>    Run for N seconds (0 = until you quit)
+  csub flood flags (mirror psub; reads each stream to its end):
+    -n, --subscriptions <n>  Streams to read (one set of readers per {prefix}{i})
+    -c, --clients <n>        Concurrent catch-up readers per stream (default 4)
+    -p, --stream-prefix <s>  Stream prefix (default yapper-cs-)
+        --create-streams     Populate streams first if missing/empty
+        --stream-length <n>  Events per stream when creating (default 10000)
+    -e, --event-size <n>     Payload size when creating (default 64)
+    -d, --duration <secs>    Timeout: stop if not caught up first (0 = no timeout)
+        --delete-streams     Also delete created streams on a clean exit (kept by default)
+  Exits when every reader reaches the end of its stream, or when the timeout fires.
 
   psub flood flags:
     -n, --subscriptions <n>  Subscription groups (one per stream {prefix}{i})
@@ -322,15 +336,18 @@ Commands:
         --create-streams     Populate streams first if missing/empty
         --stream-length <n>  Events per stream when creating (default 10000)
     -e, --event-size <n>     Payload size when creating (default 64)
-    -d, --duration <secs>    Run for N seconds (0 = until you quit)
-        --keep               Keep groups on exit (don't delete)
+    -d, --duration <secs>    Timeout: stop if not drained first (0 = no timeout)
+        --keep               Keep groups (and created streams) on exit
+        --delete-streams     Also delete created streams on a clean exit (kept by default)
+  Exits when the streams are drained, or when the timeout fires — whichever is first.
   Persistent-sub groups are unsubscribed and deleted on exit unless --keep.
 
   Examples:
     write -s orders -e '{\"id\":1}' -t OrderPlaced
     write flood -c 8 -r 1000 -s 10 -e 50 -b 5 -p yap
+    write flood -c 8 -d 30          (sustained writes for 30s)
     read flood -c 4 -r 200 -b 100
-    csub flood -c 4 -d 60
+    csub flood -n 4 -c 3 --create-streams --stream-length 50000 -d 120
     psub flood -n 4 -c 3 --create-streams --stream-length 50000 --ack-mode mix -d 120
 
 Server dashboard tabs: System · Disk · Queues · Subs · Conns · Cache
@@ -339,6 +356,9 @@ Server dashboard tabs: System · Disk · Queues · Subs · Conns · Cache
   Tab ↹ next tab · Shift+Tab previous tab
 
 View:     Ctrl+B toggles line charts vs sparkline bars
+Help:     Ctrl+H toggles this overlay
+Cancel:   Esc (or `stop`) gracefully stops the running command — any groups or
+          streams it created are deleted first. Quitting cancels the same way.
 
 Editing:  ←/→ move · Home/End · ↑/↓ command history · Backspace/Del
-Keys:     Enter run · Esc close help · Ctrl+C / Ctrl+D quit";
+Keys:     Enter run · Ctrl+H close help · Esc cancel/close help · Ctrl+C / Ctrl+D quit";

@@ -4,11 +4,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use kurrentdb::{
     AppendToStreamOptions, Client, ClientSettings, DeletePersistentSubscriptionOptions,
-    Error as KurrentError, EventData, NakAction, PersistentSubscriptionOptions, ReadAllOptions,
-    ReadStreamOptions, StreamPosition, SubscribeToAllOptions,
+    DeleteStreamOptions, Error as KurrentError, EventData, NakAction, PersistentSubscriptionOptions,
+    ReadAllOptions, ReadStreamOptions, StreamPosition, SubscribeToAllOptions,
     SubscribeToPersistentSubscriptionOptions, SubscribeToStreamOptions,
 };
 use rand::distributions::{Alphanumeric, DistString};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -68,6 +69,9 @@ pub struct FloodParams {
     pub event_size: usize,
     pub batch_size: usize,
     pub stream_prefix: String,
+    /// When > 0, run the flood for this many seconds (sustained load), looping
+    /// past `requests`. When 0, stop once each client has done `requests`.
+    pub duration: u64,
 }
 
 /// What a persistent-subscription consumer does with each message it receives.
@@ -130,8 +134,44 @@ pub struct SubFloodParams {
     pub stream_length: usize,
     /// Event payload size in bytes when creating streams.
     pub event_size: usize,
-    /// Keep subscription groups on exit instead of deleting them.
+    /// Keep subscription groups (and created streams) on exit instead of deleting.
     pub keep: bool,
+    /// Also delete the streams this run created on a clean exit (kept by default).
+    pub delete_streams: bool,
+}
+
+/// Parameters for a catch-up subscription read-load test (flood). Mirrors the
+/// persistent-subscription flood, minus the bits that don't apply to catch-up
+/// subscriptions (groups, acking, cleanup).
+#[derive(Debug, Clone)]
+pub struct CatchupFloodParams {
+    /// Number of streams to read; one per stream `{stream_prefix}{i}`.
+    pub subscriptions: usize,
+    /// Concurrent catch-up readers per stream.
+    pub clients: usize,
+    /// Stream name prefix; streams are `{stream_prefix}{i}`.
+    pub stream_prefix: String,
+    /// Populate streams first if missing/empty (otherwise the run aborts).
+    pub create_streams: bool,
+    /// Events to write per stream when creating.
+    pub stream_length: usize,
+    /// Event payload size in bytes when creating streams.
+    pub event_size: usize,
+    /// Also delete the streams this run created on a clean exit (kept by default;
+    /// a cancelled run always deletes them).
+    pub delete_streams: bool,
+}
+
+/// How a flood's run phase ended, deciding the wind-down message and whether to
+/// clean up the streams the run created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// The work finished naturally (psub: drained; csub: caught up to the end).
+    Drained,
+    /// The timeout elapsed first.
+    TimedOut,
+    /// The user cancelled the run.
+    Cancelled,
 }
 
 /// Thin wrapper around the KurrentDB client plus the config it was built from.
@@ -212,15 +252,26 @@ impl Db {
         p: FloodParams,
         metrics: Arc<Metrics>,
         reporter: &Reporter,
+        cancel: CancellationToken,
     ) -> Result<()> {
         metrics.set_active(true);
         let batch_size = p.batch_size.max(1);
-        reporter.stage(format!(
-            "Write flood: {} client(s) × {} stream(s) × {} request(s), batch {batch_size}…",
-            p.clients.max(1),
-            p.streams.max(1),
-            p.requests.max(1),
-        ));
+        let timed = p.duration > 0;
+        reporter.stage(if timed {
+            format!(
+                "Write flood: {} client(s) × {} stream(s), batch {batch_size}, for {}s…",
+                p.clients.max(1),
+                p.streams.max(1),
+                p.duration,
+            )
+        } else {
+            format!(
+                "Write flood: {} client(s) × {} stream(s) × {} request(s), batch {batch_size}…",
+                p.clients.max(1),
+                p.streams.max(1),
+                p.requests.max(1),
+            )
+        });
 
         let mut handles = Vec::new();
         for _client in 0..p.clients.max(1) {
@@ -234,8 +285,14 @@ impl Db {
                 handles.push(tokio::spawn(async move {
                     let stream_name = format!("{prefix}{}", Uuid::new_v4());
                     let mut written = 0usize;
-                    while written < requests {
-                        let this_batch = batch_size.min(requests - written);
+                    // In timed mode keep appending until aborted at the deadline;
+                    // otherwise stop once `requests` events are written.
+                    while timed || written < requests {
+                        let this_batch = if timed {
+                            batch_size
+                        } else {
+                            batch_size.min(requests - written)
+                        };
                         let mut events = Vec::with_capacity(this_batch);
                         let mut batch_bytes = 0u64;
                         for _ in 0..this_batch {
@@ -270,9 +327,25 @@ impl Db {
             }
         }
 
-        reporter.stage("Running…");
-        for h in handles {
-            let _ = h.await;
+        reporter.stage(if timed {
+            format!("Running for {}s…", p.duration)
+        } else {
+            "Running…".to_string()
+        });
+        if timed {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(p.duration)) => {}
+                _ = cancel.cancelled() => {}
+            }
+        } else {
+            tokio::select! {
+                _ = async { for h in &mut handles { let _ = h.await; } } => {}
+                _ = cancel.cancelled() => {}
+            }
+        }
+        // Stop any clients still running (a no-op once they've finished naturally).
+        for h in &handles {
+            h.abort();
         }
         metrics.set_active(false);
         Ok(())
@@ -285,14 +358,24 @@ impl Db {
         p: FloodParams,
         metrics: Arc<Metrics>,
         reporter: &Reporter,
+        cancel: CancellationToken,
     ) -> Result<()> {
         metrics.set_active(true);
         let page = p.batch_size.max(1);
-        reporter.stage(format!(
-            "Read flood: {} client(s) paging $all × {} pass(es), page {page}…",
-            p.clients.max(1),
-            p.requests.max(1),
-        ));
+        let timed = p.duration > 0;
+        reporter.stage(if timed {
+            format!(
+                "Read flood: {} client(s) paging $all, page {page}, for {}s…",
+                p.clients.max(1),
+                p.duration,
+            )
+        } else {
+            format!(
+                "Read flood: {} client(s) paging $all × {} pass(es), page {page}…",
+                p.clients.max(1),
+                p.requests.max(1),
+            )
+        });
 
         let mut handles = Vec::new();
         for _client in 0..p.clients.max(1) {
@@ -301,7 +384,9 @@ impl Db {
             let requests = p.requests.max(1);
 
             handles.push(tokio::spawn(async move {
-                for _ in 0..requests {
+                let mut done = 0usize;
+                // In timed mode keep paging until aborted; otherwise do `requests` passes.
+                while timed || done < requests {
                     let options = ReadAllOptions::default()
                         .position(StreamPosition::Start)
                         .forwards()
@@ -333,13 +418,30 @@ impl Db {
                         }
                         Err(_) => metrics.record_error(),
                     }
+                    done += 1;
                 }
             }));
         }
 
-        reporter.stage("Running…");
-        for h in handles {
-            let _ = h.await;
+        reporter.stage(if timed {
+            format!("Running for {}s…", p.duration)
+        } else {
+            "Running…".to_string()
+        });
+        if timed {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(p.duration)) => {}
+                _ = cancel.cancelled() => {}
+            }
+        } else {
+            tokio::select! {
+                _ = async { for h in &mut handles { let _ = h.await; } } => {}
+                _ = cancel.cancelled() => {}
+            }
+        }
+        // Stop any clients still running (a no-op once they've finished naturally).
+        for h in &handles {
+            h.abort();
         }
         metrics.set_active(false);
         Ok(())
@@ -352,74 +454,113 @@ impl Db {
     /// and unsubscribing — before returning.
     pub async fn catchup_flood(
         &self,
-        stream: &str,
-        clients: usize,
+        p: CatchupFloodParams,
         metrics: Arc<Metrics>,
         duration: u64,
         reporter: &Reporter,
+        cancel: CancellationToken,
     ) -> Result<()> {
-        let all = stream.is_empty() || stream == "$all" || stream == "all";
-        metrics.set_active(true);
-        let target = if all { "$all" } else { stream };
-        reporter.stage(format!(
-            "Catch-up flood: subscribing {} reader(s) to '{target}'…",
-            clients.max(1),
-        ));
+        let n = p.subscriptions.max(1);
+        let clients = p.clients.max(1);
+        let streams: Vec<String> = (0..n).map(|i| format!("{}{i}", p.stream_prefix)).collect();
 
-        let mut handles = Vec::with_capacity(clients.max(1));
-        for _ in 0..clients.max(1) {
-            let db = self.clone();
-            let metrics = metrics.clone();
-            let stream = stream.to_string();
-            handles.push(tokio::spawn(async move {
-                let mut sub = if all {
-                    db.client
-                        .subscribe_to_all(
-                            &SubscribeToAllOptions::default().position(StreamPosition::Start),
-                        )
-                        .await
-                } else {
-                    db.client
+        // Phase 1: ensure every target stream is populated (mirrors psub flood).
+        // Each of the `clients` readers per stream reads the whole stream, so the
+        // run is "caught up" once that many events have been read in total.
+        // `created` are the streams we populated, removed on cancel.
+        let (per_stream, created) = self
+            .ensure_streams(&streams, p.create_streams, p.stream_length, p.event_size, reporter)
+            .await?;
+        let target = per_stream * clients as u64;
+
+        // Phase 2: spawn n × clients catch-up readers from the start of each stream.
+        metrics.set_active(true);
+        reporter.stage(format!("Subscribing {} catch-up reader(s)…", n * clients));
+        let mut handles = Vec::with_capacity(n * clients);
+        for stream in &streams {
+            for _ in 0..clients {
+                let db = self.clone();
+                let metrics = metrics.clone();
+                let stream = stream.clone();
+                handles.push(tokio::spawn(async move {
+                    let mut sub = db
+                        .client
                         .subscribe_to_stream(
                             stream.as_str(),
                             &SubscribeToStreamOptions::default().start_from(StreamPosition::Start),
                         )
-                        .await
-                };
-                loop {
-                    match sub.next().await {
-                        Ok(event) => {
-                            let bytes = event.get_original_event().data.len() as u64;
-                            // A streaming subscription has no request/response
-                            // latency, so only throughput and bytes are recorded.
-                            metrics.record_op(0, bytes);
-                        }
-                        Err(_) => {
-                            metrics.record_error();
-                            return;
+                        .await;
+                    loop {
+                        match sub.next().await {
+                            Ok(event) => {
+                                let bytes = event.get_original_event().data.len() as u64;
+                                // A streaming subscription has no request/response
+                                // latency, so only throughput and bytes are recorded.
+                                metrics.record_op(0, bytes);
+                            }
+                            Err(_) => {
+                                metrics.record_error();
+                                return;
+                            }
                         }
                     }
-                }
-            }));
+                }));
+            }
         }
 
-        reporter.stage(running_note(duration));
-        if duration > 0 {
-            tokio::time::sleep(Duration::from_secs(duration)).await;
+        // Phase 3: run until every reader has read its stream to the end (caught
+        // up) or the timeout elapses, whichever comes first. With no timeout
+        // (duration 0) we wait for the catch-up.
+        reporter.stage(if duration > 0 {
+            format!("Reading (up to {duration}s, or until caught up)…")
         } else {
-            futures::future::pending::<()>().await;
-        }
-        reporter.stage("Stopping subscribers…");
+            "Reading until caught up…".to_string()
+        });
+        let outcome = {
+            let m = metrics.clone();
+            let caught_up = count_reached(target, move || m.total_ops());
+            if duration > 0 {
+                tokio::select! {
+                    _ = caught_up => Outcome::Drained,
+                    _ = tokio::time::sleep(Duration::from_secs(duration)) => Outcome::TimedOut,
+                    _ = cancel.cancelled() => Outcome::Cancelled,
+                }
+            } else {
+                tokio::select! {
+                    _ = caught_up => Outcome::Drained,
+                    _ = cancel.cancelled() => Outcome::Cancelled,
+                }
+            }
+        };
+
+        // Phase 4: stop the readers (aborting drops each subscription); a cancelled
+        // run also removes the streams it populated.
+        reporter.stage(match outcome {
+            Outcome::Drained => "Caught up to the end of all streams; stopping readers…".to_string(),
+            Outcome::TimedOut => format!("Timeout ({duration}s) reached; stopping readers…"),
+            Outcome::Cancelled => "Cancelled; stopping readers and cleaning up…".to_string(),
+        });
         for h in &handles {
             h.abort();
         }
         metrics.set_active(false);
+        // Created streams are removed on cancel, or on a clean exit when
+        // --delete-streams was asked; otherwise they're kept.
+        if outcome == Outcome::Cancelled || p.delete_streams {
+            self.delete_streams(&created, reporter).await;
+        }
         Ok(())
     }
 
     /// Catch-up subscribe to a stream (or `$all`), invoking `on_event` for each
-    /// event until the future is dropped / cancelled.
-    pub async fn subscribe_catchup<F>(&self, stream: &str, mut on_event: F) -> Result<()>
+    /// event until `cancel` is triggered (or the future is dropped). Catch-up
+    /// subscriptions create nothing server-side, so there is nothing to clean up.
+    pub async fn subscribe_catchup<F>(
+        &self,
+        stream: &str,
+        cancel: CancellationToken,
+        mut on_event: F,
+    ) -> Result<()>
     where
         F: FnMut(String),
     {
@@ -441,7 +582,10 @@ impl Db {
         };
 
         loop {
-            let event = sub.next().await.ctx("reading subscription event")?;
+            let event = tokio::select! {
+                ev = sub.next() => ev.ctx("reading subscription event")?,
+                _ = cancel.cancelled() => return Ok(()),
+            };
             let e = event.get_original_event();
             on_event(format!(
                 "{}@{} {} {}",
@@ -461,6 +605,7 @@ impl Db {
         group: &str,
         create: bool,
         keep: bool,
+        cancel: CancellationToken,
         mut on_event: F,
     ) -> Result<()>
     where
@@ -493,7 +638,10 @@ impl Db {
 
         let result = async {
             loop {
-                let event = sub.next().await.ctx("reading persistent event")?;
+                let event = tokio::select! {
+                    ev = sub.next() => ev.ctx("reading persistent event")?,
+                    _ = cancel.cancelled() => return Ok(()),
+                };
                 let line = {
                     let e = event.get_original_event();
                     format!(
@@ -544,6 +692,66 @@ impl Db {
         }
     }
 
+    /// Ensure every target stream is populated. Returns the total event count
+    /// across them (events one reader/consumer sees per pass) and the names of the
+    /// streams this call actually created, so a cancelled run can delete them.
+    /// Bails if a stream is missing/empty and `create_streams` is false. Shared by
+    /// the persistent- and catch-up-subscription floods.
+    async fn ensure_streams(
+        &self,
+        streams: &[String],
+        create_streams: bool,
+        stream_length: usize,
+        event_size: usize,
+        reporter: &Reporter,
+    ) -> Result<(u64, Vec<String>)> {
+        reporter.stage(format!("Checking {} stream(s)…", streams.len()));
+        let mut target = 0u64;
+        let mut created = Vec::new();
+        for stream in streams {
+            let count = self.stream_event_count(stream).await?;
+            match count {
+                Some(c) if c > 0 => target += c,
+                _ => {
+                    if !create_streams {
+                        let what = if count.is_none() {
+                            "does not exist"
+                        } else {
+                            "is empty"
+                        };
+                        anyhow::bail!(
+                            "stream '{stream}' {what}; pass --create-streams (with --stream-length) \
+                             to populate {} stream(s) before subscribing",
+                            streams.len()
+                        );
+                    }
+                    reporter.stage(format!(
+                        "Populating '{stream}' (up to {stream_length} events)…"
+                    ));
+                    self.populate_stream(stream, stream_length, event_size)
+                        .await?;
+                    target += stream_length as u64;
+                    created.push(stream.clone());
+                }
+            }
+        }
+        Ok((target, created))
+    }
+
+    /// Best-effort delete of streams created by a run that is being torn down.
+    async fn delete_streams(&self, streams: &[String], reporter: &Reporter) {
+        if streams.is_empty() {
+            return;
+        }
+        reporter.stage(format!("Deleting {} created stream(s)…", streams.len()));
+        for stream in streams {
+            let _ = self
+                .client
+                .delete_stream(stream.as_str(), &DeleteStreamOptions::default())
+                .await;
+        }
+    }
+
     /// Append `count` random events to `stream` in batches, used to pre-populate
     /// streams for a persistent-subscription load test.
     async fn populate_stream(&self, stream: &str, count: usize, event_size: usize) -> Result<()> {
@@ -582,36 +790,19 @@ impl Db {
         metrics: Arc<Metrics>,
         duration: u64,
         reporter: &Reporter,
+        cancel: CancellationToken,
     ) -> Result<()> {
         let n = p.subscriptions.max(1);
         let streams: Vec<String> = (0..n).map(|i| format!("{}{i}", p.stream_prefix)).collect();
 
         // Phase 1: make sure every target stream is populated, failing fast (before
-        // any subscribing) if streams are missing and we weren't asked to create them.
-        reporter.stage(format!("Checking {n} stream(s)…"));
-        for stream in &streams {
-            let count = self.stream_event_count(stream).await?;
-            let empty = matches!(count, None | Some(0));
-            if empty {
-                if !p.create_streams {
-                    let what = if count.is_none() {
-                        "does not exist"
-                    } else {
-                        "is empty"
-                    };
-                    anyhow::bail!(
-                        "stream '{stream}' {what}; pass --create-streams (with --stream-length) \
-                         to populate {n} stream(s) before subscribing"
-                    );
-                }
-                reporter.stage(format!(
-                    "Populating '{stream}' (up to {} events)…",
-                    p.stream_length
-                ));
-                self.populate_stream(stream, p.stream_length, p.event_size)
-                    .await?;
-            }
-        }
+        // any subscribing) if streams are missing and we weren't asked to create
+        // them. `target_events` is the number of terminal settles that means the
+        // streams have been fully drained; `created` are the streams we populated,
+        // removed on a cancel so an aborted run leaves nothing behind.
+        let (target_events, created) = self
+            .ensure_streams(&streams, p.create_streams, p.stream_length, p.event_size, reporter)
+            .await?;
 
         // Phase 2: create one persistent group per stream (idempotent). Start from
         // the beginning so consumers replay the populated history.
@@ -653,25 +844,46 @@ impl Db {
             }
         }
 
-        // Phase 4: run for the requested window. When duration is 0 we wait forever;
-        // the CLI cancels this future on Ctrl-C.
-        reporter.stage(running_note(duration));
-        if duration > 0 {
-            tokio::time::sleep(Duration::from_secs(duration)).await;
+        // Phase 4: run until the streams are drained (consumers process everything
+        // and go quiet) or the timeout elapses, whichever comes first. With no
+        // timeout (duration 0) we wait for the drain; redelivery modes that never
+        // drain then run until cancelled (Ctrl-C on the CLI / quitting the TUI).
+        reporter.stage(if duration > 0 {
+            format!("Running (up to {duration}s, or until streams drain)…")
         } else {
-            futures::future::pending::<()>().await;
-        }
+            "Running until streams drain…".to_string()
+        });
+        let outcome = {
+            let m = metrics.clone();
+            let drained = count_reached(target_events, move || m.total_settled());
+            if duration > 0 {
+                tokio::select! {
+                    _ = drained => Outcome::Drained,
+                    _ = tokio::time::sleep(Duration::from_secs(duration)) => Outcome::TimedOut,
+                    _ = cancel.cancelled() => Outcome::Cancelled,
+                }
+            } else {
+                tokio::select! {
+                    _ = drained => Outcome::Drained,
+                    _ = cancel.cancelled() => Outcome::Cancelled,
+                }
+            }
+        };
 
         // Phase 5: unsubscribe every consumer (aborting drops its subscription)
-        // and tear down the groups unless asked to keep them.
-        reporter.stage("Stopping consumers…");
+        // and tear down what the run created, unless asked to keep it.
+        reporter.stage(match outcome {
+            Outcome::Drained => "Reached end of streams; stopping consumers…".to_string(),
+            Outcome::TimedOut => format!("Timeout ({duration}s) reached; stopping consumers…"),
+            Outcome::Cancelled => "Cancelled; stopping consumers and cleaning up…".to_string(),
+        });
         for h in &handles {
             h.abort();
         }
         metrics.set_active(false);
 
         if p.keep {
-            reporter.stage("Keeping subscription groups.");
+            reporter.stage("Keeping subscription groups and created streams.");
         } else {
             reporter.stage(format!("Deleting {n} subscription group(s)…"));
             for stream in &streams {
@@ -683,6 +895,11 @@ impl Db {
                         &DeletePersistentSubscriptionOptions::default(),
                     )
                     .await;
+            }
+            // Created streams are removed on cancel (so an aborted test leaves
+            // nothing behind), or on a clean exit when --delete-streams was asked.
+            if outcome == Outcome::Cancelled || p.delete_streams {
+                self.delete_streams(&created, reporter).await;
             }
         }
         Ok(())
@@ -715,6 +932,10 @@ impl Db {
             }
         };
 
+        // A nack only advances the subscription past the message (terminally
+        // settles it) when it parks or skips; retry/stop keep redelivering it.
+        let terminal_nack = matches!(nack_action, NackAction::Park | NackAction::Skip);
+
         let mut seen = 0u64;
         loop {
             let event = match sub.next().await {
@@ -726,34 +947,53 @@ impl Db {
             };
             let bytes = event.get_original_event().data.len() as u64;
             let start = Instant::now();
-            let result = match ack_mode {
-                AckMode::Ack => sub.ack(&event).await,
-                AckMode::Nack => sub.nack(&event, nack_action.into(), "yapper").await,
+            // Each settle carries whether it terminally drains the event, so the
+            // flood can tell "everything consumed" from "stalled on unacked work".
+            let (result, terminal) = match ack_mode {
+                AckMode::Ack => (sub.ack(&event).await, true),
+                AckMode::Nack => (
+                    sub.nack(&event, nack_action.into(), "yapper").await,
+                    terminal_nack,
+                ),
                 AckMode::Mix => {
                     if seen.is_multiple_of(2) {
-                        sub.ack(&event).await
+                        (sub.ack(&event).await, true)
                     } else {
-                        sub.nack(&event, nack_action.into(), "yapper").await
+                        (
+                            sub.nack(&event, nack_action.into(), "yapper").await,
+                            terminal_nack,
+                        )
                     }
                 }
                 // Never settle: count the receive and let the server time it out.
-                AckMode::None => Ok(()),
+                AckMode::None => (Ok(()), false),
             };
             seen += 1;
             match result {
-                Ok(_) => metrics.record_op(start.elapsed().as_micros() as u32, bytes),
+                Ok(_) => {
+                    metrics.record_op(start.elapsed().as_micros() as u32, bytes);
+                    if terminal {
+                        metrics.record_settled();
+                    }
+                }
                 Err(_) => metrics.record_error(),
             }
         }
     }
 }
 
-/// Stage message for the run window of a timed job (0 = runs until cancelled).
-fn running_note(duration: u64) -> String {
-    if duration > 0 {
-        format!("Running for {duration}s…")
-    } else {
-        "Running until stopped…".to_string()
+/// Resolve once `current()` reaches `target`, polling a few times a second. Used
+/// to end a flood when its work is done — psub: every event terminally settled
+/// (acked / parked / skipped); csub: every event read by every reader — with a
+/// timeout racing it as the backstop. Work that never reaches `target` (psub
+/// redelivery modes, a reader that died) just runs until that timeout.
+async fn count_reached(target: u64, current: impl Fn() -> u64) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(200));
+    loop {
+        ticker.tick().await; // the first tick completes immediately
+        if current() >= target {
+            return;
+        }
     }
 }
 
@@ -783,6 +1023,47 @@ mod tests {
         assert_eq!(truncate("hello", 3), "hel…");
         // Newlines are flattened to spaces.
         assert_eq!(truncate("a\nb", 10), "a b");
+    }
+
+    /// Once the target count is reached, the watcher resolves — this is what lets
+    /// `psub flood` (terminal settles) and `csub flood` (events read) exit at the
+    /// end of the streams.
+    #[tokio::test(start_paused = true)]
+    async fn count_reached_resolves_at_target() {
+        let metrics = Metrics::new();
+        for _ in 0..10 {
+            metrics.record_settled();
+        }
+        // With the clock paused, virtual time auto-advances through the polls,
+        // so this resolves quickly; the generous timeout just guards a hang.
+        let m = metrics.clone();
+        tokio::time::timeout(Duration::from_secs(60), count_reached(10, move || m.total_settled()))
+            .await
+            .expect("count_reached should resolve once the target is reached");
+    }
+
+    /// When the counter never reaches `target` (e.g. ack-mode none receives but
+    /// never settles), the watcher must not resolve — the run relies on the
+    /// timeout instead.
+    #[tokio::test(start_paused = true)]
+    async fn count_reached_waits_below_target() {
+        let metrics = Metrics::new();
+        let pump = {
+            let metrics = metrics.clone();
+            // Plenty of ops, but they never *settle* — like ack-mode none.
+            tokio::spawn(async move {
+                loop {
+                    metrics.record_op(0, 0);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+        };
+        let m = metrics.clone();
+        let res =
+            tokio::time::timeout(Duration::from_secs(10), count_reached(10, move || m.total_settled()))
+                .await;
+        assert!(res.is_err(), "count_reached resolved before the target");
+        pump.abort();
     }
 
     #[test]
@@ -859,8 +1140,9 @@ mod tests {
             event_size: 16,
             batch_size: 5,
             stream_prefix: "yapper-it-".to_string(),
+            duration: 0,
         };
-        db.write_flood(params, metrics.clone(), &Reporter::silent())
+        db.write_flood(params, metrics.clone(), &Reporter::silent(), CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(metrics.total_ops(), 16);
@@ -885,8 +1167,9 @@ mod tests {
             stream_length: 200,
             event_size: 16,
             keep: false,
+            delete_streams: false,
         };
-        db.subscribe_flood(params, metrics.clone(), 2, &Reporter::silent())
+        db.subscribe_flood(params, metrics.clone(), 2, &Reporter::silent(), CancellationToken::new())
             .await
             .unwrap();
         // The two consumers should have processed at least some of the 200 events.
@@ -910,10 +1193,11 @@ mod tests {
             stream_length: 100,
             event_size: 16,
             keep: false,
+            delete_streams: false,
         };
         // Without --create-streams the run must fail fast on the missing stream.
         let err = db
-            .subscribe_flood(params, metrics, 2, &Reporter::silent())
+            .subscribe_flood(params, metrics, 2, &Reporter::silent(), CancellationToken::new())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("--create-streams"));

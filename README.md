@@ -41,11 +41,17 @@ yapper csub  -s my-stream                       # catch-up subscribe / live tail
 yapper psub  -s my-stream -g my-group --create  # one persistent-subscription consumer
 
 yapper write flood -c 4 -r 1000 -s 10 -p yap    # 4 clients, 1000 reqs, 10 streams each
+yapper write flood -c 8 -d 30                    # sustained writes for 30s (-d defines the run)
 yapper read  flood -c 4 -r 1000 -b 100          # 4 clients paging through $all
-yapper csub  flood -c 4 -d 60                   # 4 concurrent catch-up readers for 60s
+yapper csub  flood -n 4 -c 3 --create-streams --stream-length 50000 -d 120  # catch-up read-load
 yapper psub  flood -n 4 -c 3 --create-streams --stream-length 50000 --ack-mode mix -d 120
 yapper tui                                      # interactive TUI + live dashboard
 ```
+
+For `write flood` / `read flood`, `-d/--duration` is optional and **defines how long the
+flood runs**: with it the clients keep working for that many seconds (sustained load,
+`--requests` is ignored); without it the flood stops once each client has done its
+`--requests`. (This differs from `psub flood`, where `-d` is a drain *timeout* — see below.)
 
 The **same commands work inside the TUI** — type them at the prompt to drive the
 live dashboard. Pass `--config <path>` to use an alternate config file.
@@ -64,8 +70,14 @@ yapper psub flood \
   --create-streams \         # populate streams first if they are missing/empty
   --stream-length 50000 \    # events written per stream when creating
   -e 64 \                    # event payload size in bytes when creating
-  -d 120                     # run for 120s (omit / 0 = run until Ctrl-C)
+  -d 120                     # timeout: stop after 120s if not already drained (0 = no timeout)
 ```
+
+The run **exits as soon as the streams are drained** — i.e. consumers have processed
+everything and gone quiet — or when the `-d` timeout elapses, whichever comes first. With
+`-d 0` there is no timeout, so it runs until the streams drain (or until you Ctrl-C). The
+redelivery modes that never drain (`--ack-mode none`, or `nack` / `mix` with
+`--nack-action retry`) keep messages flowing, so for those the timeout is what stops the run.
 
 The target streams must **already be populated**. If a stream is missing or empty the run
 aborts with a message unless you pass `--create-streams`, which writes `--stream-length`
@@ -80,6 +92,11 @@ events to each stream first so the subscribers have history to consume.
 
 Consumers are unsubscribed and the groups are deleted on exit unless you pass `--keep`.
 The single-consumer `yapper psub -s … -g …` tears its group down the same way.
+
+Streams created by `--create-streams` are **kept** on a clean exit (so you can inspect or
+re-run against them); pass `--delete-streams` to remove them on exit too, or `--keep` to
+retain everything. A cancelled run always deletes what it created (unless `--keep`). The
+same `--delete-streams` flag applies to `csub flood`.
 
 ## Testing
 
@@ -98,11 +115,16 @@ and expect a node reachable via the default config (`127.0.0.1:2113`, insecure).
 Inside `yapper tui`, type commands at the prompt — they use the **same grammar** as the
 CLI, so anything above works here too (`write flood -c 8`, `psub flood -n 4 …`, etc.):
 
-- `help` — show available commands
 - `clear` — clear the output
 - `write` / `read` / `csub` / `psub` (each with optional `flood`) — run a job and drive
   the live dashboard; single-event reads and subscription events stream to the console
-- `Esc` / `Ctrl+D` — back / close help, `Ctrl+C` — quit
+- `Esc` (or `stop` / `cancel`) — gracefully stop the running command
+- `Ctrl+H` — toggle the help overlay (`Esc` also closes it), `Ctrl+C` / `Ctrl+D` — quit
+
+Cancelling a command (via `Esc` / `stop` on the TUI, or `Ctrl+C` on the CLI) is
+**graceful**: the run stops, and anything it created — persistent-subscription groups,
+and streams populated by `--create-streams` — is deleted before it exits. Quitting the
+TUI while a command runs cancels it the same way first.
 
 Long-running jobs report their **stage** as they progress — on the CLI each stage prints
 to stdout, and in the TUI it shows live in the Client panel's status line and is logged to

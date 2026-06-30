@@ -8,6 +8,11 @@ pub struct Metrics {
     ops: AtomicU64,
     errors: AtomicU64,
     bytes: AtomicU64,
+    /// Messages terminally settled — acked, or nacked with park/skip. These are
+    /// the dispositions that advance a persistent subscription past an event (a
+    /// retried / never-settled message is *not* counted), so this tracks how many
+    /// distinct events have actually been drained.
+    settled: AtomicU64,
     active: AtomicBool,
     /// Recent operation latencies in microseconds, drained on each snapshot.
     latencies_us: Mutex<Vec<u32>>,
@@ -19,6 +24,7 @@ impl Default for Metrics {
             ops: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            settled: AtomicU64::new(0),
             active: AtomicBool::new(false),
             latencies_us: Mutex::new(Vec::new()),
         }
@@ -52,8 +58,17 @@ impl Metrics {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record that one message was terminally settled (acked / parked / skipped).
+    pub fn record_settled(&self) {
+        self.settled.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn total_ops(&self) -> u64 {
         self.ops.load(Ordering::Relaxed)
+    }
+
+    pub fn total_settled(&self) -> u64 {
+        self.settled.load(Ordering::Relaxed)
     }
 
     pub fn total_errors(&self) -> u64 {
@@ -87,6 +102,7 @@ impl Metrics {
         self.ops.store(0, Ordering::Relaxed);
         self.errors.store(0, Ordering::Relaxed);
         self.bytes.store(0, Ordering::Relaxed);
+        self.settled.store(0, Ordering::Relaxed);
         if let Ok(mut lat) = self.latencies_us.lock() {
             lat.clear();
         }
@@ -130,10 +146,13 @@ mod tests {
         let m = Metrics::new();
         m.record_op(5, 5);
         m.record_error();
+        m.record_settled();
+        assert_eq!(m.total_settled(), 1);
         m.reset();
         assert_eq!(m.total_ops(), 0);
         assert_eq!(m.total_errors(), 0);
         assert_eq!(m.total_bytes(), 0);
+        assert_eq!(m.total_settled(), 0);
         let (p50, p99) = m.drain_latency_percentiles();
         assert!(p50.abs() < 1e-12 && p99.abs() < 1e-12);
     }

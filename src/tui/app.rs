@@ -66,6 +66,8 @@ pub enum Outcome {
     Quit,
     /// Run a parsed command in the background, feeding the dashboard.
     Run { job: Job, label: String },
+    /// Gracefully cancel the currently running command (if any).
+    Cancel,
 }
 
 pub struct App {
@@ -334,11 +336,22 @@ impl App {
             return Outcome::None;
         }
 
+        // Ctrl-H toggles the help overlay (also handled before the char insert).
+        if ctrl && matches!(key.code, KeyCode::Char('h')) {
+            self.show_help = !self.show_help;
+            return Outcome::None;
+        }
+
         match key.code {
             KeyCode::Esc => {
-                // Only ever dismisses the help overlay; never quits, so it's
-                // safe to mash while typing.
-                self.show_help = false;
+                // Esc closes the help overlay if it's open; otherwise it asks the
+                // event loop to cancel the running command (a no-op if idle). It
+                // never quits, so it's safe to mash.
+                if self.show_help {
+                    self.show_help = false;
+                } else {
+                    return Outcome::Cancel;
+                }
             }
             KeyCode::Enter => return self.submit(),
             KeyCode::Backspace => self.backspace(),
@@ -443,18 +456,15 @@ impl App {
             self.history.push(line.clone());
         }
 
-        // `help`/`clear`/`quit` are TUI-only meta commands; everything else goes
-        // through the same clap grammar the CLI uses, so the two front-ends stay
-        // in lock-step.
+        // `clear`/`quit` are TUI-only meta commands; everything else goes through
+        // the same clap grammar the CLI uses, so the two front-ends stay in
+        // lock-step. (Help is the Ctrl-H overlay, not a typed command.)
         match line.split_whitespace().next().unwrap_or("") {
-            "help" => {
-                self.show_help = true;
-                Outcome::None
-            }
             "clear" => {
                 self.output.clear();
                 Outcome::None
             }
+            "stop" | "cancel" => Outcome::Cancel,
             "quit" | "exit" => Outcome::Quit,
             _ => self.run_command(line),
         }
@@ -519,11 +529,15 @@ mod tests {
     }
 
     #[test]
-    fn submit_help_sets_flag() {
+    fn ctrl_h_toggles_help_without_typing() {
         let mut app = App::new(Metrics::new());
-        app.set_input("help".to_string());
-        assert!(matches!(app.submit(), Outcome::None));
+        assert!(!app.show_help);
+        assert!(matches!(app.handle_key(ctrl('h')), Outcome::None));
         assert!(app.show_help);
+        assert!(matches!(app.handle_key(ctrl('h')), Outcome::None));
+        assert!(!app.show_help);
+        // The toggle must never leak into the command buffer.
+        assert!(app.input.is_empty());
     }
 
     #[test]
@@ -641,13 +655,24 @@ mod tests {
     }
 
     #[test]
-    fn esc_only_closes_help_and_never_quits() {
+    fn esc_closes_help_then_cancels_and_never_quits() {
         let mut app = App::new(Metrics::new());
         app.show_help = true;
+        // First Esc closes the help overlay (no cancel yet).
         assert!(matches!(app.handle_key(key(KeyCode::Esc)), Outcome::None));
         assert!(!app.show_help);
-        // With help closed, Esc is a no-op (does not quit).
-        assert!(matches!(app.handle_key(key(KeyCode::Esc)), Outcome::None));
+        // With help closed, Esc asks the event loop to cancel the running job
+        // (a no-op there if idle) — never a quit.
+        assert!(matches!(app.handle_key(key(KeyCode::Esc)), Outcome::Cancel));
+    }
+
+    #[test]
+    fn stop_command_requests_cancel() {
+        let mut app = App::new(Metrics::new());
+        app.set_input("stop".to_string());
+        assert!(matches!(app.submit(), Outcome::Cancel));
+        app.set_input("cancel".to_string());
+        assert!(matches!(app.submit(), Outcome::Cancel));
     }
 
     #[test]

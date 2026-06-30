@@ -16,6 +16,7 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 
@@ -113,6 +114,9 @@ async fn event_loop(
     let mut stats_error_logged = false;
     // Cadence + running totals for the periodic progress line logged while a job runs.
     let mut progress = ProgressTrail::default();
+    // The in-flight job's cancel token + handle, so it can be cancelled (and its
+    // cleanup awaited on quit). `None` when idle.
+    let mut current_job: Option<(CancellationToken, tokio::task::JoinHandle<()>)> = None;
 
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
@@ -122,16 +126,38 @@ async fn event_loop(
         };
         match event {
             AppEvent::Key(key) => match app.handle_key(key) {
-                Outcome::Quit => break,
+                Outcome::Quit => {
+                    // Cancel a running job and let it tear down what it created
+                    // (delete groups / created streams) before we leave.
+                    if let Some((cancel, handle)) = current_job.take() {
+                        cancel.cancel();
+                        let _ = handle.await;
+                    }
+                    break;
+                }
                 Outcome::None => {}
+                Outcome::Cancel => {
+                    if let Some((cancel, _)) = &current_job {
+                        cancel.cancel();
+                        app.push_log("Cancelling… cleaning up…");
+                    }
+                }
                 Outcome::Run { job, label } => {
+                    // A new run supersedes any finished job slot; if one is somehow
+                    // still live, cancel it first so we don't lose its cleanup.
+                    if let Some((cancel, _)) = &current_job {
+                        cancel.cancel();
+                    }
                     app.metrics.reset();
                     app.throughput.clear();
                     app.flood_running = true;
                     app.current_flood = label.clone();
                     app.current_stage.clear();
                     progress.reset();
-                    spawn_job(db.clone(), job, app.metrics.clone(), tx.clone(), label);
+                    let cancel = CancellationToken::new();
+                    let handle =
+                        spawn_job(db.clone(), job, app.metrics.clone(), tx.clone(), label, cancel.clone());
+                    current_job = Some((cancel, handle));
                 }
             },
             AppEvent::Tick => {
@@ -159,6 +185,7 @@ async fn event_loop(
             AppEvent::FloodFinished(msg) => {
                 app.flood_running = false;
                 app.current_stage.clear();
+                current_job = None;
                 app.push_log(msg);
             }
         }
@@ -223,7 +250,8 @@ fn spawn_job(
     metrics: Arc<Metrics>,
     tx: mpsc::UnboundedSender<AppEvent>,
     label: String,
-) {
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     // Stage messages from long-running jobs flow back as their own event so the
     // dashboard can show the current stage and keep a trail in the console.
     let reporter = {
@@ -259,7 +287,9 @@ fn spawn_job(
                     )));
                 })
             }
-            Job::WriteFlood(params) => db.write_flood(params, metrics, &reporter).await,
+            Job::WriteFlood(params) => {
+                db.write_flood(params, metrics, &reporter, cancel.clone()).await
+            }
             Job::ReadSingle {
                 stream,
                 count,
@@ -273,20 +303,18 @@ fn spawn_job(
                     }
                 }
             }),
-            Job::ReadFlood(params) => db.read_flood(params, metrics, &reporter).await,
+            Job::ReadFlood(params) => {
+                db.read_flood(params, metrics, &reporter, cancel.clone()).await
+            }
             Job::Catchup { stream } => {
                 let tx = tx.clone();
-                db.subscribe_catchup(&stream, move |line| {
+                db.subscribe_catchup(&stream, cancel.clone(), move |line| {
                     let _ = tx.send(AppEvent::Log(line));
                 })
                 .await
             }
-            Job::CatchupFlood {
-                stream,
-                clients,
-                duration,
-            } => {
-                db.catchup_flood(&stream, clients, metrics, duration, &reporter)
+            Job::CatchupFlood { params, duration } => {
+                db.catchup_flood(params, metrics, duration, &reporter, cancel.clone())
                     .await
             }
             Job::PsubSingle {
@@ -296,19 +324,24 @@ fn spawn_job(
                 keep,
             } => {
                 let tx = tx.clone();
-                db.subscribe_persistent(&stream, &group, create, keep, move |line| {
+                db.subscribe_persistent(&stream, &group, create, keep, cancel.clone(), move |line| {
                     let _ = tx.send(AppEvent::Log(line));
                 })
                 .await
             }
             Job::PsubFlood { params, duration } => {
-                db.subscribe_flood(params, metrics, duration, &reporter).await
+                db.subscribe_flood(params, metrics, duration, &reporter, cancel.clone())
+                    .await
             }
         };
-        let msg = match result {
-            Ok(()) => format!("Finished: {label}"),
-            Err(e) => format!("Error ({label}): {e:#}"),
+        let msg = if cancel.is_cancelled() {
+            format!("Cancelled: {label}")
+        } else {
+            match result {
+                Ok(()) => format!("Finished: {label}"),
+                Err(e) => format!("Error ({label}): {e:#}"),
+            }
         };
         let _ = tx.send(AppEvent::FloodFinished(msg));
-    });
+    })
 }

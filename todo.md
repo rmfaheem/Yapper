@@ -1,0 +1,1 @@
+Add cancel command, allow deletion on cancel
